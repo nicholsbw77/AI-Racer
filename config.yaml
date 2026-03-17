@@ -2,9 +2,25 @@ training:
   # Only train on laps within this % of your personal best
   clean_lap_threshold: 1.01
 
-  # Frames of action history included in state vector
-  # At 360Hz, 15 frames = ~42ms of context
-  sequence_history: 15
+  # Sample rate of your .ibt telemetry files.
+  # iRacing records .ibt at 60Hz by default.
+  # 360Hz is available if you enable it in iRacing app.ini:
+  #   [DataServerSubscriptions] iRacingDataRate=360
+  # This value is used to auto-compute sequence_history from
+  # context_window_ms so the model sees the same real-time
+  # context window regardless of recording rate.
+  data_hz: 60              # set to 360 if you have 360Hz .ibt files
+
+  # How many milliseconds of action history to include in the state vector.
+  # sequence_history frames will be computed as: round(context_window_ms / 1000 * data_hz)
+  # e.g. 250ms @ 60Hz = 15 frames | 250ms @ 360Hz = 90 frames
+  context_window_ms: 250
+
+  # Frames of action history - auto-computed from context_window_ms + data_hz.
+  # You can override this manually by setting it to a fixed integer instead.
+  # At 60Hz:  15 frames = ~250ms of context
+  # At 360Hz: 90 frames = ~250ms of context
+  sequence_history: auto
 
   # Loss weight for penalizing jerky inputs (steering especially)
   smoothness_weight: 0.15

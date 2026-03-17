@@ -50,7 +50,21 @@ logger = logging.getLogger(__name__)
 
 def load_config(path: str = "config.yaml") -> dict:
     with open(path) as f:
-        return yaml.safe_load(f)
+        cfg = yaml.safe_load(f)
+    _resolve_sequence_history(cfg)
+    return cfg
+
+
+def _resolve_sequence_history(cfg: dict):
+    train_cfg = cfg["training"]
+    if train_cfg.get("sequence_history") == "auto":
+        hz = int(train_cfg.get("data_hz", 60))
+        ms = float(train_cfg.get("context_window_ms", 250))
+        train_cfg["sequence_history"] = max(1, round(ms / 1000.0 * hz))
+        logger.info(
+            f"sequence_history=auto resolved to {train_cfg['sequence_history']} "
+            f"frames ({ms:.0f}ms @ {hz}Hz)"
+        )
 
 
 class BotOrchestrator:
