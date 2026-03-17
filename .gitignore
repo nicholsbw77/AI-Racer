@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+Lib/
+Scripts/
+Include/
+share/
+pyvenv.cfg
+*.pth
+
+# Data files (too large for git)
+data/*.ibt
+data/processed/
+data/raw/
+
+# Training outputs
+checkpoints/
+logs/
+*.pt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Archives
+*.zip
+
+# Misc
+*.log

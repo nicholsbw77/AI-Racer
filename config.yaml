@@ -1,0 +1,78 @@
+training:
+  # Only train on laps within this % of your personal best
+  clean_lap_threshold: 1.01
+
+  # Frames of action history included in state vector
+  # At 360Hz, 15 frames = ~42ms of context
+  sequence_history: 15
+
+  # Loss weight for penalizing jerky inputs (steering especially)
+  smoothness_weight: 0.15
+
+  # Loss weights per output channel
+  throttle_loss_weight: 1.0
+  brake_loss_weight: 1.2    # slightly higher - braking mistakes are costly
+  steering_loss_weight: 1.5 # highest - steering errors compound quickly
+
+  batch_size: 4096
+  epochs: 300
+  lr: 3.0e-4
+  lr_patience: 20           # epochs before LR reduction on plateau
+  lr_factor: 0.5
+  weight_decay: 1.0e-5
+
+  val_split: 0.1
+  seed: 42
+
+model:
+  hidden_dims: [256, 256, 128, 64]
+  dropout: 0.05             # small dropout - we want to memorize expert behavior
+
+inference:
+  # Exponential moving average smoothing on outputs
+  # Lower = smoother but more lag, higher = more responsive but jittery
+  ema_alpha: 0.20
+
+  # Target control loop frequency (Hz) - iRacing physics tick
+  loop_hz: 360
+
+  # Minimum confidence threshold - below this, hold last action
+  # (reserved for future uncertainty estimation)
+  min_confidence: 0.0
+
+  # Output clamping
+  throttle_min: 0.0
+  throttle_max: 1.0
+  brake_min: 0.0
+  brake_max: 1.0
+  steering_min: -1.0
+  steering_max: 1.0
+
+  # Safety cutoff - if speed < this (m/s), release all inputs
+  # Prevents runaway if session ends or car stalls
+  min_speed_cutoff: 2.0
+
+features:
+  # All VRS/iRacing column names mapped to our normalized names
+  # Adjust if your VRS export uses different column names
+  lap_dist_pct: "lap_distance_pct"   # 0-1 normalized track position
+  speed: "speed"                      # m/s from VRS (VX component or norm)
+  throttle: "throttle"                # 0-1
+  brake: "brake"                      # 0-1
+  steering: "steeringWheelAngle"      # radians, we normalize to -1/+1
+  gear: "gear"
+  rpm: "rpm"
+  lat_g: "accelerationY"             # lateral G (Y = right in vehicle frame)
+  lon_g: "accelerationX"             # longitudinal G (X = forward)
+  track_pos: "trackPosition"         # lateral offset from centerline (-1 to +1)
+  lap_distance: "lap_distance"       # meters from start/finish
+
+  # Max steering wheel angle (radians) for normalization
+  # Common values: Mazda MX-5=450deg, GTE=450deg, Formula=270deg
+  # Will be auto-detected from data if not set here
+  steering_lock_radians: null        # null = auto-detect
+
+paths:
+  checkpoints: "checkpoints/"
+  logs: "logs/"
+  processed_data: "data/processed/"
