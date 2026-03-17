@@ -16,7 +16,7 @@ import torch
 from torch.utils.data import Dataset
 from typing import Tuple
 
-from trainer.loader import STATE_FEATURES, ACTION_FEATURES, HISTORY_ACTIONS
+from loader import STATE_FEATURES, ACTION_FEATURES, HISTORY_ACTIONS
 
 
 class TelemetryDataset(Dataset):

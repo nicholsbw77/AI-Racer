@@ -12,7 +12,7 @@ from typing import Optional, Tuple
 import numpy as np
 import torch
 
-from trainer.model import DrivingPolicyNet
+from model import DrivingPolicyNet
 
 logger = logging.getLogger(__name__)
 

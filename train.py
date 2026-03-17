@@ -23,12 +23,9 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 import yaml
 
-# Add project root to path
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from trainer.loader import load_track_car_dataset
-from trainer.dataset import TelemetryDataset, split_dataset
-from trainer.model import DrivingPolicyNet, BehaviorCloningLoss
+from loader import load_track_car_dataset
+from dataset import TelemetryDataset, split_dataset
+from model import DrivingPolicyNet, BehaviorCloningLoss
 
 logging.basicConfig(
     level=logging.INFO,
@@ -79,8 +76,14 @@ def train_one_combo(
     logger.info(f"{'='*60}")
 
     # --- Data ---
-    df = load_track_car_dataset(combo_folder, cfg)
-    if df is None:
+    parquet_path = os.path.join(combo_folder, "data.parquet")
+    if os.path.exists(parquet_path):
+        import pandas as pd
+        df = pd.read_parquet(parquet_path)
+        logger.info(f"Loaded {len(df):,} frames from {parquet_path}")
+    else:
+        df = load_track_car_dataset(combo_folder, cfg)
+    if df is None or len(df) == 0:
         logger.warning(f"Skipping {combo_name}: no data")
         return False
 
@@ -99,11 +102,14 @@ def train_one_combo(
     logger.info(f"Train samples: {len(train_set):,}  |  Val samples: {len(val_set):,}")
     logger.info(f"Input dim: {full_dataset.input_dim}  |  Output dim: {full_dataset.output_dim}")
 
+    # num_workers=0 on Windows avoids slow multiprocessing spawn overhead;
+    # dataset fits in memory so DataLoader overhead is minimal
+    num_workers = 0 if sys.platform == "win32" else 4
     train_loader = DataLoader(
         train_set,
         batch_size=train_cfg["batch_size"],
         shuffle=True,
-        num_workers=4,
+        num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
     )
@@ -111,7 +117,7 @@ def train_one_combo(
         val_set,
         batch_size=train_cfg["batch_size"] * 2,
         shuffle=False,
-        num_workers=2,
+        num_workers=num_workers,
         pin_memory=True,
     )
 

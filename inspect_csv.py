@@ -11,11 +11,9 @@ Usage:
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
 import pandas as pd
 import yaml
-from trainer.loader import load_vrs_csv, normalize_features, COLUMN_CANDIDATES
+from loader import load_vrs_csv, normalize_features, COLUMN_CANDIDATES
 
 
 def main():
