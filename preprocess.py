@@ -1,39 +1,37 @@
 """
-scripts/preprocess.py
+preprocess.py
 
-Converts raw VRS CSV exports to processed, normalized datasets.
+Converts raw iRacing .ibt telemetry files to processed, normalized datasets.
 Run this once before training.
 
 Usage:
-  python scripts/preprocess.py --input data/raw/ --output data/processed/
+  python preprocess.py --input data/ --output data/processed/
 
-Expects input structure:
-  data/raw/
-    <trackId>_<carId>/
-      session_001.csv
-      session_002.csv
-      ...
+Scans the input folder for .ibt files, groups them by car+track combo
+(parsed from the iRacing filename convention), normalizes and engineers
+features, then writes one data.parquet + meta.yaml per combo.
+
+iRacing .ibt filename convention:
+  {car}_{track} {YYYY-MM-DD HH-MM-SS} ({utc_timestamp}).ibt
+  e.g. cadillacctsvr_lagunaseca 2023-08-16 00-09-26 (2023_08_18 13_28_45 UTC).ibt
 
 Outputs:
   data/processed/
-    <trackId>_<carId>/
-      *.csv   (cleaned, normalized, engineered)
-      meta.yaml  (dataset stats for this combo)
+    {car}_{track}/
+      data.parquet   (cleaned, normalized, feature-engineered)
+      meta.yaml      (dataset stats)
 """
 
 import sys
-import os
 import argparse
 import logging
+from collections import defaultdict
 from pathlib import Path
 
 import pandas as pd
 import yaml
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from trainer.loader import (
-    load_vrs_csv,
+from loader import (
     normalize_features,
     engineer_features,
     filter_clean_laps,
@@ -41,6 +39,7 @@ from trainer.loader import (
     STATE_FEATURES,
     ACTION_FEATURES,
 )
+from ibt_loader import load_ibt_file, parse_combo_from_filename
 
 logging.basicConfig(
     level=logging.INFO,
@@ -69,22 +68,43 @@ def _resolve_sequence_history(cfg: dict):
         )
 
 
-def preprocess_combo(input_dir: Path, output_dir: Path, cfg: dict) -> dict:
-    """Process one track/car folder. Returns stats dict."""
-    import glob
-
-    csv_files = sorted(glob.glob(str(input_dir / "*.csv")))
-    if not csv_files:
-        logger.warning(f"No CSV files in {input_dir}")
+def group_ibt_files(input_root: Path) -> dict:
+    """
+    Scan input_root for .ibt files and group them by {car}_{track} combo.
+    Returns dict: combo_name → list of Path objects.
+    """
+    ibt_files = sorted(input_root.glob("**/*.ibt"))
+    if not ibt_files:
         return {}
 
-    logger.info(f"Processing {input_dir.name}: {len(csv_files)} files")
+    groups = defaultdict(list)
+    for fpath in ibt_files:
+        car_id, track_id = parse_combo_from_filename(str(fpath))
+        # Sanitize for use as a directory name (replace spaces with underscores)
+        track_safe = track_id.replace(" ", "_")
+        combo_name = f"{car_id}_{track_safe}"
+        groups[combo_name].append(fpath)
+
+    return dict(groups)
+
+
+def preprocess_combo(
+    combo_name: str,
+    ibt_files: list,
+    output_dir: Path,
+    cfg: dict,
+) -> dict:
+    """
+    Process all .ibt files for one track/car combo.
+    Returns stats dict, or empty dict on failure.
+    """
+    logger.info(f"\nProcessing {combo_name}: {len(ibt_files)} file(s)")
 
     all_dfs = []
     skipped = 0
 
-    for i, fpath in enumerate(csv_files):
-        df = load_vrs_csv(fpath)
+    for i, fpath in enumerate(ibt_files):
+        df = load_ibt_file(str(fpath))
         if df is None:
             skipped += 1
             continue
@@ -92,49 +112,55 @@ def preprocess_combo(input_dir: Path, output_dir: Path, cfg: dict) -> dict:
         df = normalize_features(df, cfg)
         df = engineer_features(df)
 
-        # Re-index laps globally
+        # Re-index lapIndex globally across files to avoid collisions
         if "lapIndex" in df.columns:
-            df["lapIndex"] = df["lapIndex"] + i * 10000
+            df["lapIndex"] = df["lapIndex"].astype(int) + i * 10000
 
         all_dfs.append(df)
 
     if not all_dfs:
-        logger.warning(f"No valid data in {input_dir}")
+        logger.warning(f"No valid data for {combo_name}")
         return {}
 
     combined = pd.concat(all_dfs, ignore_index=True)
 
-    # Compute and save lap times before filtering
+    # Lap time stats before filtering
     lap_times = compute_lap_times(combined)
-    personal_best = lap_times.min() if len(lap_times) > 0 else None
+    personal_best = float(lap_times.min()) if len(lap_times) > 0 else None
     total_laps = len(lap_times)
 
-    # Filter to clean laps
+    # Filter to clean laps only
     threshold = cfg["training"]["clean_lap_threshold"]
     combined = filter_clean_laps(combined, threshold)
     clean_laps = len(compute_lap_times(combined))
 
+    if len(combined) == 0:
+        logger.warning(f"No clean laps in {combo_name}")
+        return {}
+
     # Normalize speed globally for this combo
-    speed_max = combined["speed"].max()
+    speed_max = float(combined["speed"].max())
     if speed_max > 0:
         combined["speed"] = combined["speed"] / speed_max
         combined["speed_delta"] = combined["speed_delta"] / speed_max
 
-    # Save processed data
+    # Write output
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / "data.parquet"
     combined.to_parquet(output_path, index=False)
 
-    # Save metadata
     meta = {
-        "combo_name": input_dir.name,
-        "total_files": len(csv_files),
+        "combo_name": combo_name,
+        "source_files": [str(f) for f in ibt_files],
+        "total_files": len(ibt_files),
         "skipped_files": skipped,
         "total_laps": int(total_laps),
         "clean_laps": int(clean_laps),
-        "total_bins": len(combined),
-        "personal_best_s": float(personal_best) if personal_best else None,
-        "speed_max_ms": float(speed_max),
+        "total_frames": len(combined),
+        "personal_best_s": personal_best,
+        "speed_max_ms": speed_max,
+        "data_hz": cfg["training"].get("data_hz", 60),
+        "sequence_history": cfg["training"]["sequence_history"],
         "features": STATE_FEATURES,
         "actions": ACTION_FEATURES,
     }
@@ -144,7 +170,7 @@ def preprocess_combo(input_dir: Path, output_dir: Path, cfg: dict) -> dict:
 
     logger.info(
         f"  ✓ {clean_laps}/{total_laps} clean laps, "
-        f"{len(combined):,} bins → {output_path}"
+        f"{len(combined):,} frames → {output_path}"
     )
     if personal_best:
         mins = int(personal_best // 60)
@@ -155,12 +181,14 @@ def preprocess_combo(input_dir: Path, output_dir: Path, cfg: dict) -> dict:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Preprocess VRS telemetry CSVs")
-    parser.add_argument("--input", default="data/raw/",
-                        help="Input folder with track/car subfolders")
+    parser = argparse.ArgumentParser(description="Preprocess iRacing .ibt telemetry files")
+    parser.add_argument("--input", default="data/",
+                        help="Folder containing .ibt files (searched recursively)")
     parser.add_argument("--output", default="data/processed/",
                         help="Output folder for processed datasets")
     parser.add_argument("--config", default="config.yaml")
+    parser.add_argument("--combo", default=None,
+                        help="Only process this combo name (e.g. cadillacctsvr_lagunaseca)")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -172,31 +200,39 @@ def main():
         logger.error(f"Input folder not found: {input_root}")
         sys.exit(1)
 
-    combos = [d for d in input_root.iterdir() if d.is_dir()]
-    if not combos:
-        logger.error(f"No track/car subfolders found in {input_root}")
-        logger.error("Expected: data/raw/<trackId>_<carId>/lap_001.csv ...")
+    groups = group_ibt_files(input_root)
+    if not groups:
+        logger.error(f"No .ibt files found in {input_root}")
         sys.exit(1)
 
-    logger.info(f"Found {len(combos)} track/car combo(s)")
+    logger.info(f"Found {sum(len(v) for v in groups.values())} .ibt files "
+                f"across {len(groups)} track/car combo(s):")
+    for combo, files in sorted(groups.items()):
+        logger.info(f"  {combo}: {len(files)} file(s)")
+
+    # Filter to specific combo if requested
+    if args.combo:
+        groups = {k: v for k, v in groups.items() if args.combo.lower() in k.lower()}
+        if not groups:
+            logger.error(f"No combo matching '{args.combo}' found")
+            sys.exit(1)
 
     all_meta = {}
-    for combo_dir in sorted(combos):
-        out_dir = output_root / combo_dir.name
-        meta = preprocess_combo(combo_dir, out_dir, cfg)
+    for combo_name, ibt_files in sorted(groups.items()):
+        out_dir = output_root / combo_name
+        meta = preprocess_combo(combo_name, ibt_files, out_dir, cfg)
         if meta:
-            all_meta[combo_dir.name] = meta
+            all_meta[combo_name] = meta
 
-    # Summary
-    logger.info("\n" + "="*50)
+    logger.info("\n" + "=" * 50)
     logger.info("PREPROCESSING COMPLETE")
-    logger.info("="*50)
-    total_bins = sum(m.get("total_bins", 0) for m in all_meta.values())
+    logger.info("=" * 50)
+    total_frames = sum(m.get("total_frames", 0) for m in all_meta.values())
     total_laps = sum(m.get("clean_laps", 0) for m in all_meta.values())
-    logger.info(f"Combos processed: {len(all_meta)}")
-    logger.info(f"Total clean laps: {total_laps:,}")
-    logger.info(f"Total training bins: {total_bins:,}")
-    logger.info(f"Output: {output_root}")
+    logger.info(f"Combos processed  : {len(all_meta)}")
+    logger.info(f"Total clean laps  : {total_laps:,}")
+    logger.info(f"Total frames      : {total_frames:,}")
+    logger.info(f"Output            : {output_root}")
 
 
 if __name__ == "__main__":
