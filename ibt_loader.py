@@ -61,6 +61,15 @@ IBT_CHANNEL_MAP = {
 REQUIRED_CHANNELS = {"Speed", "Throttle", "Brake", "SteeringWheelAngle", "LapDistPct"}
 
 
+def _get_available_channels(ibt) -> set:
+    """Get channel names from an open IBT object, supporting multiple pyirsdk versions."""
+    if hasattr(ibt, "var_headers_names") and ibt.var_headers_names:
+        return set(ibt.var_headers_names)
+    if hasattr(ibt, "var_headers_dict") and ibt.var_headers_dict:
+        return set(ibt.var_headers_dict.keys())
+    return set()
+
+
 def load_ibt_file(filepath: str) -> Optional[pd.DataFrame]:
     """
     Load a single .ibt file into a cleaned DataFrame.
@@ -86,7 +95,7 @@ def load_ibt_file(filepath: str) -> Optional[pd.DataFrame]:
         return None
 
     # Check required channels are present
-    available = set(ibt.var_headers_dict.keys()) if hasattr(ibt, "var_headers_dict") else set()
+    available = _get_available_channels(ibt)
     missing = REQUIRED_CHANNELS - available
     if missing:
         logger.warning(f"Skipping {path.name}: missing channels {missing}")
@@ -97,11 +106,14 @@ def load_ibt_file(filepath: str) -> Optional[pd.DataFrame]:
     data = {}
     for iracing_name, canonical_name in IBT_CHANNEL_MAP.items():
         try:
-            values = ibt[iracing_name]
+            values = ibt.get_all(iracing_name)
             if values is not None:
                 data[canonical_name] = np.array(values, dtype=np.float32)
         except Exception:
             logger.debug(f"Could not read channel {iracing_name} from {path.name}")
+
+    # Extract track length before closing the file
+    track_length_m = _get_track_length(ibt) if hasattr(ibt, "session_info") else None
 
     ibt.close()
 
@@ -116,10 +128,6 @@ def load_ibt_file(filepath: str) -> Optional[pd.DataFrame]:
         return None
 
     df = pd.DataFrame({k: v[:min_len] for k, v in data.items()})
-
-    # Derive lap_dist (meters) from lap_dist_pct if we have session info
-    # iRacing session YAML contains track length
-    track_length_m = _get_track_length(ibt) if hasattr(ibt, "session_info") else None
     if track_length_m and track_length_m > 0 and "lap_dist_pct" in df.columns:
         df["lap_dist"] = df["lap_dist_pct"] * track_length_m
         df["trackLength"] = track_length_m
@@ -195,15 +203,14 @@ def get_session_info(filepath: str) -> dict:
                 info["car_id"]   = d.get("CarPath", "")
                 info["car_name"] = d.get("CarScreenNameShort", "")
 
-        if hasattr(ibt, "var_headers_dict"):
-            info["channels"] = sorted(ibt.var_headers_dict.keys())
+        info["channels"] = sorted(_get_available_channels(ibt))
 
         # Sample rate from first channel header
         if hasattr(ibt, "var_headers") and ibt.var_headers:
             # iRacing tick rate is in the disk header, not per-channel
             # Estimate from SessionTime delta
             try:
-                times = ibt["SessionTime"]
+                times = ibt.get_all("SessionTime")
                 if times is not None and len(times) > 1:
                     deltas = np.diff(np.array(times[:100]))
                     avg_dt = float(np.median(deltas[deltas > 0]))

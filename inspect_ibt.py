@@ -87,8 +87,8 @@ def inspect(filepath: str):
     for iracing_name, canonical_name in IBT_CHANNEL_MAP.items():
         present = iracing_name in channels
         required = iracing_name in REQUIRED_CHANNELS
-        status = "✓" if present else ("✗ REQUIRED" if required else "- optional")
-        print(f"  {iracing_name:30s} → {canonical_name:15s} {status}")
+        status = "OK" if present else ("MISSING (required)" if required else "- optional")
+        print(f"  {iracing_name:30s} -> {canonical_name:15s} {status}")
         if not present and required:
             all_present = False
     print()
@@ -137,7 +137,7 @@ def inspect(filepath: str):
             print(f"  {col:<20} {df[col].min():>10.4f} {df[col].max():>10.4f} {df[col].mean():>10.4f}")
 
     print()
-    print("✓ File looks good — ready for preprocessing.")
+    print("File looks good -- ready for preprocessing.")
 
 
 def main():
