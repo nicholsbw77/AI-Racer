@@ -26,6 +26,7 @@ import time
 import signal
 import logging
 import argparse
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -36,16 +37,42 @@ import torch
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent))
 
-from agent.telemetry import TelemetryReader, CarState
-from agent.inference import DrivingAgent
-from agent.controller import VJoyController, MockController
+from telemetry import TelemetryReader, CarState
+from inference import DrivingAgent
+from controller import VJoyController, MockController
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
-)
+
+def setup_logging() -> Path:
+    """Configure logging to both console and a timestamped log file."""
+    log_dir = Path(__file__).parent / "logs"
+    log_dir.mkdir(exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = log_dir / f"session_{timestamp}.log"
+
+    fmt = "%(asctime)s [%(levelname)s] %(message)s"
+    datefmt = "%H:%M:%S"
+
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+
+    console = logging.StreamHandler()
+    console.setFormatter(logging.Formatter(fmt, datefmt=datefmt))
+    root.addHandler(console)
+
+    file_handler = logging.FileHandler(log_file, encoding="utf-8")
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)s [%(levelname)s] %(message)s",
+                          datefmt="%Y-%m-%d %H:%M:%S")
+    )
+    root.addHandler(file_handler)
+
+    return log_file
+
+
+log_file = setup_logging()
 logger = logging.getLogger(__name__)
+logger.info(f"Logging to: {log_file}")
 
 
 def load_config(path: str = "config.yaml") -> dict:
@@ -103,8 +130,64 @@ class BotOrchestrator:
         signal.signal(signal.SIGINT, self._shutdown_handler)
         signal.signal(signal.SIGTERM, self._shutdown_handler)
 
-    def start(self, combo_name: str):
-        """Start the bot for a given track/car combo."""
+    def _match_checkpoint(self, raw_combo: str) -> str:
+        """Match auto-detected combo to an existing checkpoint folder.
+
+        iRacing returns full display names like
+        'sebring_international_raceway_cadillac_cts_v_racecar' but checkpoints
+        use abbreviated .ibt-derived names like 'cadillacctsvr_sebring_international'.
+        We score each checkpoint folder by how many of the detected keywords it contains.
+        """
+        ckpt_dir = Path("checkpoints")
+        if not ckpt_dir.exists():
+            return raw_combo
+
+        candidates = [d.name for d in ckpt_dir.iterdir()
+                       if d.is_dir() and (d / "best.pt").exists()]
+        if not candidates:
+            return raw_combo
+
+        # Tokenize the detected combo into keywords
+        keywords = set(raw_combo.split("_"))
+        # Remove very short / common noise words
+        keywords = {k for k in keywords if len(k) > 2}
+
+        best_match = raw_combo
+        best_score = 0
+
+        for cand in candidates:
+            # Score: how many keywords appear as substrings in the candidate
+            score = sum(1 for kw in keywords if kw in cand)
+            if score > best_score:
+                best_score = score
+                best_match = cand
+
+        if best_score > 0:
+            logger.info(f"Checkpoint match: '{best_match}' (score {best_score}/{len(keywords)} keywords)")
+        else:
+            logger.warning(f"No checkpoint matched for '{raw_combo}'. Available: {candidates}")
+
+        return best_match
+
+    def start(self, combo_name: Optional[str]):
+        """Start the bot for a given track/car combo (None = auto-detect)."""
+
+        # Connect to iRacing first (needed for auto-detect)
+        if not self.mock:
+            if not self.telemetry.connect():
+                logger.warning("iRacing not detected. Waiting...")
+                # Retry loop — wait for iRacing to start
+                while not self.telemetry.connect():
+                    logger.info("Retrying iRacing connection in 5s...")
+                    time.sleep(5)
+
+        # Auto-detect combo from session
+        if combo_name is None:
+            raw_combo = self.telemetry.get_combo_name()
+            logger.info(f"Auto-detected session: {raw_combo}")
+            combo_name = self._match_checkpoint(raw_combo)
+            logger.info(f"Matched checkpoint: {combo_name}")
+
         logger.info(f"Starting bot for: {combo_name}")
 
         # Connect controller
@@ -116,15 +199,10 @@ class BotOrchestrator:
         if not self.agent.load_checkpoint(combo_name):
             if not self.mock:
                 logger.error(f"No checkpoint for '{combo_name}'. Train first.")
-                logger.error(f"Run: python trainer/train.py --data data/processed/ --track ...")
+                logger.error(f"Run: python train.py --combo {combo_name}")
                 return
             else:
                 logger.warning("Mock mode: running without model (random outputs)")
-
-        # Connect to iRacing
-        if not self.mock:
-            if not self.telemetry.connect():
-                logger.warning("iRacing not detected. Waiting...")
 
         # Start telemetry background thread
         self.telemetry.start()
@@ -164,10 +242,21 @@ class BotOrchestrator:
                     self.agent.load_checkpoint(new_combo)
                     combo_name = new_combo
 
+            # Debug: log state flags periodically
+            if self._frame_count % 300 == 0:
+                logger.info(
+                    f"State: on_track={state.is_on_track} "
+                    f"session_active={state.session_active} "
+                    f"speed={state.speed:.1f}m/s "
+                    f"gear={state.gear:.0f} "
+                    f"lap_pct={state.lap_dist_pct:.3f}"
+                )
+
             # Skip if not on track or session not active
             if not state.is_on_track or not state.session_active:
                 self.controller.release()
                 time.sleep(0.01)
+                self._frame_count += 1
                 continue
 
             # Build state vector for inference
@@ -182,8 +271,23 @@ class BotOrchestrator:
                 car_speed_ms=state.speed,
             )
 
+            # Debug: log model outputs periodically
+            if self._frame_count % 60 == 0:
+                logger.info(
+                    f"Output: thr={throttle:.3f} brk={brake:.3f} "
+                    f"steer={steering:.3f} speed={state.speed:.1f}"
+                )
+
             # Send to controller
             self.controller.set_inputs(throttle, brake, steering)
+
+            # Inject bot outputs into history buffer for next prediction
+            self.telemetry.inject_bot_actions(throttle, brake, steering)
+
+            # Handle gear shifts
+            target_gear = int(round(state.gear))
+            if target_gear != self.controller._current_gear and target_gear > 0:
+                self.controller.shift_to(target_gear)
 
             # Metrics
             self._frame_count += 1
@@ -192,7 +296,7 @@ class BotOrchestrator:
             loop_elapsed = time.perf_counter() - loop_start
             self._loop_times.append(loop_elapsed)
 
-            # Log performance every 360 frames (approx 1 second)
+            # Log performance every 360 frames (approx ~6 seconds at 60Hz)
             if self._frame_count % 360 == 0:
                 self._log_stats()
 
@@ -274,8 +378,8 @@ def main():
     elif args.track and args.car:
         combo_name = f"{args.track}_{args.car}"
     elif args.auto or args.mock:
-        # Will auto-detect from session info
-        combo_name = "auto_detect"
+        # Will auto-detect from session info after connecting
+        combo_name = None
     else:
         parser.print_help()
         print("\nExamples:")

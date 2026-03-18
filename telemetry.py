@@ -109,11 +109,35 @@ class TelemetryReader:
         if not self._connected:
             return
         try:
-            session_info = self._ir["WeekendInfo"]
-            if session_info:
-                pass  # trackId/carId come from session YAML
-        except Exception:
-            pass
+            weekend = self._ir["WeekendInfo"]
+            if weekend:
+                self._track_name = weekend.get("TrackDisplayName", "unknown_track")
+                self._track_id = str(weekend.get("TrackID", ""))
+                logger.info(f"Track: {self._track_name} (ID: {self._track_id})")
+
+            drivers = self._ir["DriverInfo"]
+            if drivers:
+                driver_idx = drivers.get("DriverCarIdx", 0)
+                driver_list = drivers.get("Drivers", [])
+                if driver_list and driver_idx < len(driver_list):
+                    self._car_name = driver_list[driver_idx].get("CarScreenName", "unknown_car")
+                    self._car_id = str(driver_list[driver_idx].get("CarID", ""))
+                    logger.info(f"Car: {self._car_name} (ID: {self._car_id})")
+        except Exception as e:
+            logger.warning(f"Could not read session info: {e}")
+
+    def get_combo_name(self) -> str:
+        """Return a sanitized track_car combo string for checkpoint lookup."""
+        track = getattr(self, "_track_name", "unknown_track")
+        car = getattr(self, "_car_name", "unknown_car")
+        # Sanitize: lowercase, replace spaces/special chars with underscore
+        combo = f"{track}_{car}".lower()
+        for ch in " -/.()":
+            combo = combo.replace(ch, "_")
+        # Collapse multiple underscores
+        while "__" in combo:
+            combo = combo.replace("__", "_")
+        return combo.strip("_")
 
     def start(self):
         """Start background telemetry reading thread."""
@@ -157,34 +181,54 @@ class TelemetryReader:
                 continue
 
             try:
-                # Block until iRacing produces a new frame (syncs to physics tick)
-                if not self._ir.wait_for_data(timeout_ms=int(timeout)):
-                    continue
+                # Sync to iRacing physics tick
+                # pyirsdk >=1.2 has wait_for_data, older versions use freeze_var_buffer
+                if hasattr(self._ir, 'wait_for_data'):
+                    if not self._ir.wait_for_data(timeout_ms=int(timeout)):
+                        continue
+                else:
+                    # Fallback: poll at target Hz
+                    self._ir.freeze_var_buffer_latest()
+                    time.sleep(1.0 / self.target_hz)
 
                 state = self._read_state()
                 with self._lock:
                     self._latest_state = state
                     self._update_history(state)
 
+            except ConnectionError:
+                logger.warning("iRacing disconnected")
+                self._connected = False
             except Exception as e:
                 logger.warning(f"Telemetry read error: {e}")
-                self._connected = False
+                time.sleep(1.0 / self.target_hz)
+
+    @staticmethod
+    def _to_float(val, default=0.0) -> float:
+        """Safely convert an iRacing SDK value to float.
+        Some pyirsdk versions return lists for certain vars."""
+        if val is None:
+            return default
+        if isinstance(val, (list, tuple)):
+            return float(val[0]) if val else default
+        return float(val)
 
     def _read_state(self) -> CarState:
         """Read current frame from iRacing shared memory."""
         ir = self._ir
+        f = self._to_float
 
-        speed = float(ir["Speed"] or 0.0)
-        throttle = float(ir["Throttle"] or 0.0)
-        brake = float(ir["Brake"] or 0.0)
-        steering = float(ir["SteeringWheelAngle"] or 0.0)
-        gear = float(ir["Gear"] or 0)
-        rpm = float(ir["RPM"] or 0.0)
-        lat_g = float(ir["LatAccel"] or 0.0)
-        lon_g = float(ir["LongAccel"] or 0.0)
-        lap_dist_pct = float(ir["LapDistPct"] or 0.0)
-        is_on_track = bool(ir["IsOnTrack"])
-        session_state = int(ir["SessionState"] or 0)
+        speed = f(ir["Speed"])
+        throttle = f(ir["Throttle"])
+        brake = f(ir["Brake"])
+        steering = f(ir["SteeringWheelAngle"])
+        gear = f(ir["Gear"])
+        rpm = f(ir["RPM"])
+        lat_g = f(ir["LatAccel"])
+        lon_g = f(ir["LongAccel"])
+        lap_dist_pct = f(ir["LapDistPct"])
+        is_on_track = bool(f(ir["IsOnTrack"]))
+        session_state = int(f(ir["SessionState"]))
 
         # Track position: iRacing provides this as fraction, center=0
         # Some SDK versions: use CarIdxTrackSurface or similar
@@ -225,6 +269,26 @@ class TelemetryReader:
         self._steering_hist[ptr] = steer_norm
         self._steer_delta_hist[ptr] = np.clip(steer_delta, -0.3, 0.3)
         self._hist_ptr += 1
+
+    def inject_bot_actions(self, throttle: float, brake: float, steering: float):
+        """Inject the bot's output into the history buffer.
+
+        During live driving the iRacing telemetry echoes vJoy inputs back,
+        but there can be a delay.  Injecting the bot's own predictions
+        ensures the history matches what the model expects.
+        """
+        with self._lock:
+            ptr = (self._hist_ptr - 1) % self._history_len
+            prev_ptr = (self._hist_ptr - 2) % self._history_len
+
+            self._throttle_hist[ptr] = throttle
+            self._brake_hist[ptr] = brake
+
+            prev_steer = self._steering_hist[prev_ptr]
+            steer_delta = float(steering - prev_steer)
+
+            self._steering_hist[ptr] = steering
+            self._steer_delta_hist[ptr] = np.clip(steer_delta, -0.3, 0.3)
 
     def get_state(self) -> Optional[CarState]:
         """Get latest state snapshot (thread-safe)."""

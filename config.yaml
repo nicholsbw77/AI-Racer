@@ -47,10 +47,10 @@ model:
 inference:
   # Exponential moving average smoothing on outputs
   # Lower = smoother but more lag, higher = more responsive but jittery
-  ema_alpha: 0.20
+  ema_alpha: 0.30
 
   # Target control loop frequency (Hz) - iRacing physics tick
-  loop_hz: 360
+  loop_hz: 60
 
   # Minimum confidence threshold - below this, hold last action
   # (reserved for future uncertainty estimation)
