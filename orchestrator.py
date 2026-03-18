@@ -126,9 +126,76 @@ class BotOrchestrator:
         self._session_start = 0.0
         self._loop_times = []  # for Hz monitoring
 
+        # Pit exit autopilot state
+        self._pit_exit_active = False
+        self._pit_exit_logged = False
+
         # Register Ctrl+C handler
         signal.signal(signal.SIGINT, self._shutdown_handler)
         signal.signal(signal.SIGTERM, self._shutdown_handler)
+
+    def _pit_exit_autopilot(self, state) -> tuple:
+        """
+        Simple autopilot to drive out of pit lane onto the track.
+
+        Strategy:
+          - 1st gear, gentle throttle (respect pit speed limit ~60 km/h)
+          - Straight steering (pit lanes are mostly straight)
+          - Slight steering correction based on lateral G to stay centered
+          - Disengage once OnPitRoad goes False (car has exited pit lane)
+
+        Returns:
+            (throttle, brake, steering) or None if pit exit is complete
+        """
+        if not state.on_pit_road:
+            # We've exited the pits
+            if self._pit_exit_active:
+                logger.info("Pit exit complete — handing off to model")
+                self._pit_exit_active = False
+            return None
+
+        if not self._pit_exit_active:
+            self._pit_exit_active = True
+            logger.info("Pit exit autopilot engaged")
+
+        # Pit speed limit is typically 60-80 km/h (16-22 m/s)
+        PIT_SPEED_LIMIT = 18.0  # m/s (~65 km/h), safe for most tracks
+
+        # Gentle throttle to get moving, back off near speed limit
+        if state.speed < 2.0:
+            # Starting from standstill — need more throttle to get rolling
+            throttle = 0.5
+        elif state.speed < PIT_SPEED_LIMIT * 0.8:
+            throttle = 0.4
+        elif state.speed < PIT_SPEED_LIMIT:
+            throttle = 0.15  # coast near limit
+        else:
+            throttle = 0.0   # over limit, lift
+
+        brake = 0.0
+
+        # Minimal steering correction using lateral G
+        # If car drifts left (negative lat_g), steer slightly right
+        # Gain is very small — pit lanes are straight, we just nudge
+        steer_correction = -state.lat_g * 0.005
+        steering = max(-0.15, min(0.15, steer_correction))
+
+        # Shift to 1st if needed, then 2nd once rolling
+        if state.speed < 5.0:
+            target_gear = 1
+        else:
+            target_gear = 2
+
+        if target_gear != self.controller._current_gear:
+            self.controller.shift_to(target_gear)
+
+        if self._frame_count % 60 == 0:
+            logger.info(
+                f"PIT EXIT: thr={throttle:.2f} steer={steering:.3f} "
+                f"speed={state.speed:.1f}m/s gear={target_gear}"
+            )
+
+        return throttle, brake, steering
 
     def _match_checkpoint(self, raw_combo: str) -> str:
         """Match auto-detected combo to an existing checkpoint folder.
@@ -246,19 +313,43 @@ class BotOrchestrator:
             if self._frame_count % 300 == 0:
                 logger.info(
                     f"State: on_track={state.is_on_track} "
+                    f"pit_road={state.on_pit_road} "
                     f"session_active={state.session_active} "
                     f"speed={state.speed:.1f}m/s "
                     f"gear={state.gear:.0f} "
                     f"lap_pct={state.lap_dist_pct:.3f}"
                 )
 
-            # Skip if not on track or session not active
-            if not state.is_on_track or not state.session_active:
+            # Skip if session not active
+            if not state.session_active:
                 self.controller.release()
                 time.sleep(0.01)
                 self._frame_count += 1
                 continue
 
+            # --- Pit exit autopilot ---
+            # If on pit road, use simple autopilot to drive out
+            pit_result = self._pit_exit_autopilot(state)
+            if pit_result is not None:
+                throttle, brake, steering = pit_result
+                self.controller.set_inputs(throttle, brake, steering)
+                self.telemetry.inject_bot_actions(throttle, brake, steering)
+                self._frame_count += 1
+
+                loop_elapsed = time.perf_counter() - loop_start
+                remaining = target_period - loop_elapsed
+                if remaining > 0.0001:
+                    time.sleep(remaining)
+                continue
+
+            # Skip if not on track (off-track excursion, not pits)
+            if not state.is_on_track:
+                self.controller.release()
+                time.sleep(0.01)
+                self._frame_count += 1
+                continue
+
+            # --- Model-driven control ---
             # Build state vector for inference
             state_vec = self.telemetry.build_state_vector(
                 state,

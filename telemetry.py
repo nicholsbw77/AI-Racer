@@ -52,6 +52,7 @@ class CarState:
     lap_dist_pct: float = 0.0    # 0-1 position on track
     track_pos: float = 0.0       # lateral offset (-1 to +1)
     is_on_track: bool = False
+    on_pit_road: bool = False
     session_active: bool = False
     track_id: str = ""
     car_id: str = ""
@@ -228,6 +229,7 @@ class TelemetryReader:
         lon_g = f(ir["LongAccel"])
         lap_dist_pct = f(ir["LapDistPct"])
         is_on_track = bool(f(ir["IsOnTrack"]))
+        on_pit_road = bool(f(ir["OnPitRoad"] or 0))
         session_state = int(f(ir["SessionState"]))
 
         # Track position: iRacing provides this as fraction, center=0
@@ -250,6 +252,7 @@ class TelemetryReader:
             lap_dist_pct=lap_dist_pct,
             track_pos=track_pos,
             is_on_track=is_on_track,
+            on_pit_road=on_pit_road,
             session_active=(session_state > 0),
             timestamp=time.perf_counter(),
         )
