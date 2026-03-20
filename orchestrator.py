@@ -149,6 +149,7 @@ class BotOrchestrator:
             "turn_duration": 1.5,
             "turn_throttle": 0.35,
             "straight_throttle": 0.40,
+            "ramp_duration": 3.0,
         }
         cfg_path = Path(__file__).parent / "pit_exit_config.json"
         if cfg_path.exists():
@@ -180,8 +181,9 @@ class BotOrchestrator:
             # We've exited the pits — start the post-pit left turn at Sebring
             if self._pit_exit_active:
                 self._pit_exit_active = False
+                self._pit_exit_cfg = self._load_pit_exit_config()
                 self._pit_exit_turn_start = time.perf_counter()
-                logger.info("Pit exit: off pit road, starting left turn merge")
+                logger.info("Pit exit: off pit road, starting merge sequence")
 
             # Post-pit-exit: drive straight, then turn (config from pit_exit_config.json)
             if self._pit_exit_turn_start is not None:
@@ -214,8 +216,29 @@ class BotOrchestrator:
                             f"elapsed={elapsed - straight_dur:.1f}/{turn_dur:.1f}s speed={state.speed:.1f}m/s"
                         )
                     return throttle, brake, steering
+                elif elapsed < straight_dur + turn_dur + pcfg.get("ramp_duration", 3.0):
+                    # Ramp-up phase: moderate straight driving to build speed
+                    # and let telemetry history stabilize before model handoff
+                    ramp_dur = pcfg.get("ramp_duration", 3.0)
+                    ramp_elapsed = elapsed - straight_dur - turn_dur
+                    t = ramp_elapsed / ramp_dur
+                    throttle = pcfg["turn_throttle"] + t * (0.5 - pcfg["turn_throttle"])
+                    # Ease steering back to center
+                    steering_correction = -state.lat_g * 0.005
+                    steering = turn_steering * (1.0 - t) + steering_correction * t
+                    steering = max(-0.5, min(0.5, steering))
+                    brake = 0.0
+                    if int(elapsed * 10) % 10 == 0:
+                        logger.info(
+                            f"PIT EXIT RAMP: steer={steering:.3f} thr={throttle:.2f} "
+                            f"blend={t:.1%} elapsed={ramp_elapsed:.1f}/{ramp_dur:.1f}s speed={state.speed:.1f}m/s"
+                        )
+                    return throttle, brake, steering
                 else:
-                    logger.info("Pit exit turn complete — handing off to model")
+                    logger.info(
+                        f"Pit exit complete — handing off to model at "
+                        f"speed={state.speed:.1f}m/s track_pos={state.track_pos:.2f}"
+                    )
                     self._pit_exit_turn_start = None
             return None
 

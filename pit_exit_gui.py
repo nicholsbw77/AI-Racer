@@ -27,6 +27,7 @@ DEFAULTS = {
     "turn_duration": 1.5,        # seconds to hold the turn
     "turn_throttle": 0.35,       # throttle during turn
     "straight_throttle": 0.40,   # throttle during straight
+    "ramp_duration": 3.0,        # seconds to blend from turn to model handoff
 }
 
 
@@ -120,6 +121,24 @@ class PitExitGUI(QWidget):
         turn_group.setLayout(tg)
         layout.addWidget(turn_group)
 
+        # --- Ramp / Handoff section ---
+        ramp_group = QGroupBox("Model Handoff Ramp")
+        rg = QGridLayout()
+
+        rg.addWidget(QLabel("Ramp duration (sec):"), 0, 0)
+        self.ramp_dur = QDoubleSpinBox()
+        self.ramp_dur.setRange(0.0, 10.0)
+        self.ramp_dur.setSingleStep(0.5)
+        self.ramp_dur.setDecimals(1)
+        self.ramp_dur.setValue(cfg["ramp_duration"])
+        rg.addWidget(self.ramp_dur, 0, 1)
+        ramp_hint = QLabel("blends from turn to full model control")
+        ramp_hint.setStyleSheet("color: gray; font-size: 10px;")
+        rg.addWidget(ramp_hint, 0, 2)
+
+        ramp_group.setLayout(rg)
+        layout.addWidget(ramp_group)
+
         # --- Buttons ---
         btn_layout = QHBoxLayout()
         save_btn = QPushButton("Save")
@@ -147,6 +166,7 @@ class PitExitGUI(QWidget):
             "turn_duration": self.turn_dur.value(),
             "turn_throttle": self.turn_thr.value(),
             "straight_throttle": self.straight_thr.value(),
+            "ramp_duration": self.ramp_dur.value(),
         }
         save_config(cfg)
         self.status.setText(f"Saved to {CONFIG_PATH.name}")
@@ -158,6 +178,7 @@ class PitExitGUI(QWidget):
         self.turn_dur.setValue(DEFAULTS["turn_duration"])
         self.turn_thr.setValue(DEFAULTS["turn_throttle"])
         self.straight_thr.setValue(DEFAULTS["straight_throttle"])
+        self.ramp_dur.setValue(DEFAULTS["ramp_duration"])
         self.status.setText("Reset to defaults (not saved yet)")
         QTimer.singleShot(3000, lambda: self.status.setText(""))
 
