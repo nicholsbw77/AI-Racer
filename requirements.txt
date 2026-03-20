@@ -9,3 +9,4 @@ pyirsdk>=1.4.0
 pyvjoy>=1.0.1
 PyQt5>=5.15.0
 pynput>=1.7.6
+pygame>=2.1.0

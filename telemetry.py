@@ -18,6 +18,7 @@ Key iRacing SDK variables used:
   SessionState    - session status
   IsOnTrack       - bool
   YawRate         - rad/s yaw (for lateral position estimation)
+  Yaw             - radians, absolute heading in world coords
 """
 
 import time
@@ -59,6 +60,8 @@ class CarState:
     lat_g: float = 0.0           # m/s² lateral acceleration
     lon_g: float = 0.0           # m/s² longitudinal acceleration
     yaw_rate: float = 0.0        # rad/s yaw rotation
+    yaw: float = 0.0             # radians, absolute heading (world coords)
+    heading_error: float = 0.0   # radians, deviation from expected track heading
     lap_dist_pct: float = 0.0    # 0-1 position on track
     track_pos: float = 0.0       # lateral offset (-1 to +1), estimated
     surface_type: int = 3        # iRacing surface enum (3=on track)
@@ -108,6 +111,10 @@ class TelemetryReader:
         self._forced_track_pos = None    # float or None
         self._forced_blend = 0.0         # 1.0 = fully forced, decays to 0.0
         self._forced_decay_rate = 0.005  # per frame (~3s to halve at 60Hz)
+
+        # Heading calibration: offset between iRacing Yaw and track map heading
+        self._yaw_offset = None          # calibrated on first good reading
+        self._yaw_calibrated = False
 
     def connect(self) -> bool:
         """Attempt to connect to iRacing. Returns True if successful."""
@@ -319,6 +326,39 @@ class TelemetryReader:
 
         return float(np.clip(track_pos, -1.0, 1.0))
 
+    def _compute_heading_error(self, yaw: float, lap_dist_pct: float,
+                                speed: float) -> float:
+        """Compute heading error between car's actual yaw and expected track heading.
+
+        Returns signed error in radians, normalized to [-pi, pi].
+        Positive = car pointing right of expected, negative = pointing left.
+        Returns 0.0 if no track map or not yet calibrated.
+        """
+        if self._track_map is None or not hasattr(self._track_map, 'get_expected_heading'):
+            return 0.0
+
+        expected_rel = self._track_map.get_expected_heading(lap_dist_pct)
+
+        # Calibrate yaw offset on first reading at reasonable speed
+        if not self._yaw_calibrated and speed > 10.0:
+            self._yaw_offset = yaw - expected_rel
+            self._yaw_calibrated = True
+            logger.info(f"Heading calibrated: yaw_offset={self._yaw_offset:.3f} rad "
+                        f"at lap_pct={lap_dist_pct:.3f}")
+            return 0.0
+
+        if not self._yaw_calibrated:
+            return 0.0
+
+        # Expected absolute yaw = expected_relative + calibration offset
+        expected_yaw = expected_rel + self._yaw_offset
+
+        # Signed difference, wrapped to [-pi, pi]
+        error = yaw - expected_yaw
+        error = (error + np.pi) % (2 * np.pi) - np.pi
+
+        return float(error)
+
     def _read_state(self) -> CarState:
         """Read current frame from iRacing shared memory."""
         ir = self._ir
@@ -333,6 +373,8 @@ class TelemetryReader:
         lat_g = f(ir["LatAccel"])
         lon_g = f(ir["LongAccel"])
         yaw_rate = f(ir["YawRate"]) if ir["YawRate"] is not None else 0.0
+        yaw_raw = ir["Yaw"]
+        yaw = f(yaw_raw) if yaw_raw is not None else 0.0
         lap_dist_pct = f(ir["LapDistPct"])
         is_on_track = bool(f(ir["IsOnTrack"]))
         on_pit_road = bool(f(ir["OnPitRoad"] or 0))
@@ -360,6 +402,9 @@ class TelemetryReader:
         self._speed_max = max(self._speed_max, speed * 1.05)
         self._rpm_max = max(self._rpm_max, rpm * 1.05)
 
+        # Compute heading error: how far car's yaw deviates from expected track heading
+        heading_error = self._compute_heading_error(yaw, lap_dist_pct, speed)
+
         return CarState(
             speed=speed,
             throttle=throttle,
@@ -370,6 +415,8 @@ class TelemetryReader:
             lat_g=lat_g,
             lon_g=lon_g,
             yaw_rate=yaw_rate,
+            yaw=yaw,
+            heading_error=heading_error,
             lap_dist_pct=lap_dist_pct,
             track_pos=track_pos,
             surface_type=surface_type,

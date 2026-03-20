@@ -16,6 +16,7 @@ controller produces zero intervention (blend factor = 0).
 """
 
 import logging
+import math
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -39,6 +40,8 @@ DEFAULT_SAFETY_CONFIG: Dict = {
     "off_track_frames_for_recovery": 3, # consecutive frames off-track before full recovery
     "speed_limit_ms": None,             # optional global speed cap (m/s), None = disabled
     "speed_profile": None,              # dict mapping lap_dist_pct ranges to max speed
+    "heading_error_warn_deg": 45.0,     # heading error (degrees) that triggers throttle cut
+    "heading_error_brake_deg": 90.0,    # heading error (degrees) that triggers hard braking
     "enabled": True,                    # master enable switch
 }
 
@@ -57,6 +60,7 @@ class InterventionStats:
     edge_danger_frames: int = 0
     lat_g_frames: int = 0
     speed_limit_frames: int = 0
+    heading_error_frames: int = 0
     recovery_mode_activations: int = 0
     last_log_time: float = 0.0
 
@@ -67,6 +71,7 @@ class InterventionStats:
             + self.edge_danger_frames
             + self.lat_g_frames
             + self.speed_limit_frames
+            + self.heading_error_frames
         ) > 0
 
 
@@ -265,6 +270,33 @@ class SafetyController:
 
                 safety_throttle = min(safety_throttle, model_throttle * (1.0 - overspeed))
                 safety_brake = max(safety_brake, 0.2 + 0.6 * overspeed)
+
+            # --- Priority 5: heading error (car pointing wrong way) ---
+            heading_err_deg = abs(math.degrees(car_state.heading_error))
+            warn_deg = self.cfg["heading_error_warn_deg"]
+            brake_deg = self.cfg["heading_error_brake_deg"]
+
+            if heading_err_deg > warn_deg and car_state.speed > 3.0:
+                self.stats.heading_error_frames += 1
+
+                # Linear ramp from warn to brake threshold
+                err_range = max(brake_deg - warn_deg, 1.0)
+                severity = min((heading_err_deg - warn_deg) / err_range, 1.0)
+                hdg_blend = severity * self.cfg["max_blend_factor"]
+
+                if hdg_blend > blend:
+                    blend = hdg_blend
+
+                # Cut throttle and apply proportional braking
+                safety_throttle = min(safety_throttle, model_throttle * (1.0 - severity))
+                safety_brake = max(safety_brake, 0.3 + 0.5 * severity)
+
+                if heading_err_deg > brake_deg and self.stats.heading_error_frames % 30 == 1:
+                    logger.warning(
+                        "HEADING ERROR: car %.0f° off expected heading "
+                        "(speed=%.1f m/s) — braking",
+                        heading_err_deg, car_state.speed,
+                    )
 
         # --- Blend model and safety outputs ---
         out_throttle = _blend(model_throttle, safety_throttle, blend)

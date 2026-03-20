@@ -219,6 +219,7 @@ class TrackMap:
         # Pre-compute derived structures
         tm._corners = None
         tm._braking_zones = None
+        tm._compute_expected_headings()
 
         logger.info(
             f"TrackMap built: {n_bins} bins, "
@@ -262,6 +263,38 @@ class TrackMap:
             for i in range(n):
                 if empty_mask[i]:
                     setattr(self.bins[i], fname, float(interp_vals[i]))
+
+    def _compute_expected_headings(self) -> None:
+        """Compute expected relative heading at each bin by integrating heading rates.
+
+        The result is a relative heading profile — the absolute offset is unknown
+        until calibrated against live Yaw data.  The profile lets us compute
+        heading *error* (how far the car's yaw deviates from expected).
+        """
+        n = self.n_bins
+        bin_width = 1.0 / n  # fraction of lap per bin
+
+        # heading field stores heading_rate (rad/s-ish, actually rad per unit distance).
+        # Integrate to get cumulative heading at each bin.
+        heading_rates = np.array([self.bins[i].heading for i in range(n)])
+
+        # Cumulative sum gives relative heading at each bin start
+        self._expected_headings = np.zeros(n)
+        cumulative = 0.0
+        for i in range(n):
+            self._expected_headings[i] = cumulative
+            cumulative += heading_rates[i] * bin_width
+
+        logger.debug(f"Expected heading profile computed ({n} bins, "
+                     f"total rotation={cumulative:.2f} rad)")
+
+    def get_expected_heading(self, lap_dist_pct: float) -> float:
+        """Return the expected relative heading at a track position (radians)."""
+        if not hasattr(self, '_expected_headings') or self._expected_headings is None:
+            return 0.0
+        idx = int(lap_dist_pct * self.n_bins)
+        idx = max(0, min(idx, self.n_bins - 1))
+        return float(self._expected_headings[idx])
 
     # ------------------------------------------------------------------
     # Speed profile
@@ -559,6 +592,7 @@ class TrackMap:
         for i, bd_dict in enumerate(data["bins"]):
             tm.bins[i] = BinData(**bd_dict)
 
+        tm._compute_expected_headings()
         logger.info(f"TrackMap loaded from {path}: {n_bins} bins")
         return tm
 

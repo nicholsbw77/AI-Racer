@@ -535,13 +535,15 @@ class BotOrchestrator:
 
             # Debug: log state flags periodically
             if self._frame_count % 300 == 0:
+                hdg_deg = np.degrees(state.heading_error)
                 logger.info(
                     f"State: on_track={state.is_on_track} "
                     f"pit_road={state.on_pit_road} "
                     f"session_active={state.session_active} "
                     f"speed={state.speed:.1f}m/s "
                     f"gear={state.gear:.0f} "
-                    f"lap_pct={state.lap_dist_pct:.3f}"
+                    f"lap_pct={state.lap_dist_pct:.3f} "
+                    f"heading_err={hdg_deg:+.1f}°"
                 )
 
             # Skip if session not active
@@ -594,10 +596,12 @@ class BotOrchestrator:
 
             # Debug: log model outputs periodically
             if self._frame_count % 60 == 0:
+                hdg_err = np.degrees(state.heading_error)
                 logger.info(
                     f"Output: thr={throttle:.3f} brk={brake:.3f} "
                     f"steer={steering:.3f} speed={state.speed:.1f} "
-                    f"track_pos={state.track_pos:.2f}"
+                    f"track_pos={state.track_pos:.2f} "
+                    f"heading_err={hdg_err:+.1f}°"
                 )
 
             # Manual override — bypass model if F-keys active
@@ -707,6 +711,7 @@ class BotOrchestrator:
                 f"Safety stats: {s.off_track_frames} off-track frames, "
                 f"{s.edge_warning_frames} edge warnings, "
                 f"{s.edge_danger_frames} edge danger frames, "
+                f"{s.heading_error_frames} heading-error frames, "
                 f"{s.recovery_mode_activations} recovery activations "
                 f"(over {s.total_frames} total frames)"
             )
