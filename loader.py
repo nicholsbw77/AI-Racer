@@ -116,10 +116,11 @@ def load_vrs_csv(filepath: str) -> Optional[pd.DataFrame]:
     return df
 
 
-def normalize_features(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
+def normalize_features(df: pd.DataFrame, cfg: dict) -> tuple:
     """
     Normalize raw telemetry values to [-1, 1] or [0, 1] ranges.
-    Modifies df in-place and returns it.
+    Modifies df in-place and returns (df, norm_constants) where
+    norm_constants is a dict of detected normalization values.
     """
     feat_cfg = cfg.get("features", {})
 
@@ -131,8 +132,9 @@ def normalize_features(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     df["gear"] = df["gear"].clip(0, 7) / 7.0
 
     # RPM: normalize 0-1 using observed max
+    rpm_max = 8000.0
     if "rpm" in df.columns:
-        rpm_max = df["rpm"].max()
+        rpm_max = float(df["rpm"].max())
         if rpm_max > 0:
             df["rpm"] = df["rpm"] / rpm_max
         else:
@@ -176,7 +178,12 @@ def normalize_features(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
         dist_max = df["lap_dist"].max()
         df["lap_dist_pct"] = (df["lap_dist"] / dist_max).clip(0.0, 1.0) if dist_max > 0 else 0.0
 
-    return df
+    norm_constants = {
+        "steering_lock_radians": float(steering_lock),
+        "rpm_max": float(rpm_max),
+    }
+
+    return df, norm_constants
 
 
 def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -274,7 +281,7 @@ def load_track_car_dataset(
         df = load_vrs_csv(fpath)
         if df is None:
             continue
-        df = normalize_features(df, cfg)
+        df, _ = normalize_features(df, cfg)
         df = engineer_features(df)
 
         # Re-index lapIndex globally across files

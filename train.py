@@ -77,6 +77,12 @@ def train_one_combo(
 
     # --- Data ---
     parquet_path = os.path.join(combo_folder, "data.parquet")
+    meta_path = os.path.join(combo_folder, "meta.yaml")
+    norm_meta = {}
+    if os.path.exists(meta_path):
+        with open(meta_path) as f:
+            norm_meta = yaml.safe_load(f) or {}
+
     if os.path.exists(parquet_path):
         import pandas as pd
         df = pd.read_parquet(parquet_path)
@@ -275,6 +281,12 @@ def train_one_combo(
                 "output_dim": full_dataset.output_dim,
                 "cfg": cfg,
                 "combo_name": combo_name,
+                "norm": {
+                    "speed_max_ms": norm_meta.get("speed_max_ms"),
+                    "steering_lock_radians": norm_meta.get("steering_lock_radians"),
+                    "rpm_max": norm_meta.get("rpm_max"),
+                    "data_hz": norm_meta.get("data_hz", train_cfg.get("data_hz", 60)),
+                },
             }, best_path)
         else:
             epochs_no_improve += 1
@@ -297,6 +309,17 @@ def train_one_combo(
     }, last_path)
 
     logger.info(f"✓ Best val loss: {best_val_loss:.5f}  Checkpoint: {best_path}")
+
+    # Build and save track map for live inference
+    try:
+        from track_map import TrackMap
+        tm = TrackMap.build_from_dataframe(df)
+        track_map_path = checkpoint_dir / "track_map.json"
+        tm.save(str(track_map_path))
+        logger.info(f"✓ Track map saved: {track_map_path}")
+    except Exception as e:
+        logger.warning(f"Could not build track map: {e}")
+
     return True
 
 

@@ -436,7 +436,8 @@ class TrackSimulator:
         self._steering_lock = 0.6
 
         # Action history ring buffer
-        self._history_len = 20
+        # Must be >= sequence_history (up to 90 frames at 360Hz/250ms)
+        self._history_len = 100
         self._throttle_hist = np.zeros(self._history_len, dtype=np.float32)
         self._brake_hist = np.zeros(self._history_len, dtype=np.float32)
         self._steering_hist = np.zeros(self._history_len, dtype=np.float32)

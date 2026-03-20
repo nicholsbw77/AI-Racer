@@ -39,6 +39,9 @@ class DrivingAgent:
         self.model: Optional[DrivingPolicyNet] = None
         self.current_combo: Optional[str] = None
 
+        # Normalization constants (loaded from checkpoint)
+        self.norm: dict = {}
+
         # EMA state
         alpha = self.inf_cfg.get("ema_alpha", 0.20)
         self.ema_alpha = alpha
@@ -84,12 +87,19 @@ class DrivingAgent:
             self.model.eval()
 
             self.current_combo = combo_name
+            self.norm = ckpt.get("norm", {})
             self._reset_ema()
 
             logger.info(
                 f"Loaded model for '{combo_name}' "
                 f"(epoch {ckpt['epoch']}, val_loss={ckpt['val_loss']:.5f})"
             )
+            if self.norm:
+                logger.info(
+                    f"Norm constants: speed_max={self.norm.get('speed_max_ms')} "
+                    f"steer_lock={self.norm.get('steering_lock_radians')} "
+                    f"rpm_max={self.norm.get('rpm_max')}"
+                )
             return True
 
         except Exception as e:

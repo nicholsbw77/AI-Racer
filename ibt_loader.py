@@ -277,7 +277,7 @@ def load_ibt_files(folder: str, cfg: dict) -> Optional[pd.DataFrame]:
         if df is None:
             continue
 
-        df = normalize_features(df, cfg)
+        df, _ = normalize_features(df, cfg)
         df = engineer_features(df)
 
         # Re-index lapIndex globally across files

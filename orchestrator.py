@@ -41,6 +41,7 @@ from telemetry import TelemetryReader, CarState
 from inference import DrivingAgent
 from controller import VJoyController, MockController
 from safety_controller import SafetyController
+from track_map import TrackMap
 
 
 def setup_logging() -> Path:
@@ -273,6 +274,28 @@ class BotOrchestrator:
             else:
                 logger.warning("Mock mode: running without model (random outputs)")
 
+        # Propagate normalization constants from checkpoint to telemetry
+        norm = self.agent.norm
+        if norm.get("speed_max_ms"):
+            self.telemetry._speed_max = norm["speed_max_ms"]
+            logger.info(f"Set telemetry speed_max={norm['speed_max_ms']:.1f} m/s")
+        if norm.get("steering_lock_radians"):
+            self.telemetry._steering_lock = norm["steering_lock_radians"]
+            logger.info(f"Set telemetry steering_lock={norm['steering_lock_radians']:.3f} rad")
+        if norm.get("rpm_max"):
+            self.telemetry._rpm_max = norm["rpm_max"]
+
+        # Load track map if available
+        checkpoint_dir = Path(cfg["paths"]["checkpoints"]) / combo_name
+        track_map_path = checkpoint_dir / "track_map.json"
+        if track_map_path.exists():
+            try:
+                track_map = TrackMap.load(str(track_map_path))
+                self.telemetry.set_track_map(track_map)
+                logger.info(f"Track map loaded: {track_map.summary().splitlines()[0]}")
+            except Exception as e:
+                logger.warning(f"Could not load track map: {e}")
+
         # Start telemetry background thread
         self.telemetry.start()
 
@@ -383,10 +406,21 @@ class BotOrchestrator:
             # Inject bot outputs into history buffer for next prediction
             self.telemetry.inject_bot_actions(throttle, brake, steering)
 
-            # Handle gear shifts
-            target_gear = int(round(state.gear))
-            if target_gear != self.controller._current_gear and target_gear > 0:
-                self.controller.shift_to(target_gear)
+            # Handle gear shifts — sync controller to iRacing's reported gear.
+            # iRacing manages the auto-clutch; we just need to send shift
+            # commands when the reported gear differs from what we last sent.
+            reported_gear = int(round(state.gear))
+            if reported_gear > 0:
+                # Sync controller's internal tracking to iRacing ground truth
+                # to prevent drift from missed shifts
+                self.controller._current_gear = reported_gear
+
+            # RPM-based shift logic: upshift near redline, downshift when lugging
+            if state.rpm > 0 and reported_gear > 0:
+                if state.rpm > 6800 and reported_gear < 6:
+                    self.controller.shift_up()
+                elif state.rpm < 2500 and reported_gear > 1 and state.speed > 5.0:
+                    self.controller.shift_down()
 
             # Metrics
             self._frame_count += 1
