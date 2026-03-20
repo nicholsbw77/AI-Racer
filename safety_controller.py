@@ -186,8 +186,23 @@ class SafetyController:
                 self._in_recovery = False
                 logger.info("Recovery mode ended -- car back on track")
 
+            # --- Stuck at edge: if car is nearly stopped at the edge,
+            # release brakes and allow gentle throttle so it can recover ---
+            if car_state.speed < 1.0 and abs_track_pos > self.cfg["edge_warning_threshold"]:
+                center_steer = -_sign(track_pos) * self.cfg["recovery_steer_gain"]
+                safety_throttle = 0.15
+                safety_brake = 0.0
+                safety_steering = center_steer
+                blend = self.cfg["max_blend_factor"]
+                self.stats.edge_warning_frames += 1
+                if self._consecutive_edge % 60 == 0:
+                    logger.info(
+                        "Edge stuck recovery: releasing brakes, creeping with steer=%.2f",
+                        center_steer,
+                    )
+
             # --- Priority 2: edge proximity ---
-            if abs_track_pos > self.cfg["edge_warning_threshold"]:
+            elif abs_track_pos > self.cfg["edge_warning_threshold"]:
                 self.stats.edge_warning_frames += 1
 
                 # Blend proportional to proximity beyond the warning line.

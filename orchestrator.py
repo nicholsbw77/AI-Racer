@@ -240,6 +240,12 @@ class BotOrchestrator:
                         f"speed={state.speed:.1f}m/s track_pos={state.track_pos:.2f}"
                     )
                     self._pit_exit_turn_start = None
+                    # Reset track position estimate to center so the model
+                    # doesn't inherit a stale offset from the pit exit path
+                    self.telemetry._track_pos_estimate = 0.0
+                    # Reset safety controller so it doesn't carry edge/recovery
+                    # state from the pit exit phase
+                    self.safety.reset()
             return None
 
         if not self._pit_exit_active:
