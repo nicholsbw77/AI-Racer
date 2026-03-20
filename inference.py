@@ -88,6 +88,23 @@ class DrivingAgent:
 
             self.current_combo = combo_name
             self.norm = ckpt.get("norm", {})
+            self.input_dim = ckpt["input_dim"]
+            # Derive sequence_history from checkpoint dimensions
+            # input_dim = n_state_features + sequence_history * n_history_actions
+            n_history_actions = 4  # throttle, brake, steering, steering_delta
+            ckpt_cfg = ckpt.get("cfg", {})
+            stored_seq = ckpt_cfg.get("training", {}).get("sequence_history")
+            if isinstance(stored_seq, int) and stored_seq > 0:
+                self.sequence_history = stored_seq
+                self.n_state_features = ckpt["input_dim"] - stored_seq * n_history_actions
+            else:
+                # Fallback: assume 15 frames of history
+                self.sequence_history = 15
+                self.n_state_features = ckpt["input_dim"] - 15 * n_history_actions
+            logger.info(
+                f"Model input_dim={ckpt['input_dim']} "
+                f"(state={self.n_state_features}, history={self.sequence_history}x{n_history_actions})"
+            )
             self._reset_ema()
 
             logger.info(

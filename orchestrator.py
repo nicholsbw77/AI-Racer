@@ -309,7 +309,13 @@ class BotOrchestrator:
     def _run_loop(self, combo_name: str):
         """Main control loop."""
         target_period = 1.0 / self.cfg["inference"]["loop_hz"]
-        sequence_history = self.cfg["training"]["sequence_history"]
+        # Use sequence_history from the loaded checkpoint (matches training)
+        if self.agent.is_ready and hasattr(self.agent, 'sequence_history'):
+            sequence_history = self.agent.sequence_history
+            n_state_features = self.agent.n_state_features
+        else:
+            sequence_history = self.cfg["training"]["sequence_history"]
+            n_state_features = None  # use default (all 14)
 
         last_track = ""
         last_car = ""
@@ -379,6 +385,7 @@ class BotOrchestrator:
             state_vec = self.telemetry.build_state_vector(
                 state,
                 sequence_history=sequence_history,
+                n_state_features=n_state_features,
             )
 
             # Run inference

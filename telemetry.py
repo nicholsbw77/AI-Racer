@@ -389,10 +389,16 @@ class TelemetryReader:
         sequence_history: int = 15,
         speed_max: Optional[float] = None,
         steering_lock: Optional[float] = None,
+        n_state_features: Optional[int] = None,
     ) -> np.ndarray:
         """
         Build the full state vector for model inference.
         Mirrors the feature engineering in loader.py exactly.
+
+        Args:
+            n_state_features: If set, truncate state features to this count.
+                This handles backwards compatibility with models trained
+                before boundary features were added.
 
         Returns numpy array of shape (input_dim,)
         """
@@ -410,9 +416,6 @@ class TelemetryReader:
         steer_abs = abs(steer_norm)
 
         # Compute speed delta from recent history
-        ptr = (self._hist_ptr - 1) % self._history_len
-        prev_ptr = (self._hist_ptr - 2) % self._history_len
-        # Use throttle hist slot to estimate - or just set 0 if no history yet
         speed_delta = 0.0  # simplified; full implementation reads speed ring buffer
 
         heavy_braking = float(state.brake > 0.3 and lon_g_norm < -0.05)
@@ -424,22 +427,30 @@ class TelemetryReader:
         on_rumble = float(track_pos_abs > 0.90)        # likely on rumble strip
         track_pos_sign = np.sign(state.track_pos)      # which side (-1=left, +1=right)
 
-        current_state = np.array([
-            state.lap_dist_pct,  # lap_dist_pct
-            speed_norm,          # speed
-            speed_delta,         # speed_delta
-            gear_norm,           # gear
-            rpm_norm,            # rpm
-            lat_g_norm,          # lat_g
-            lon_g_norm,          # lon_g
-            state.track_pos,     # track_pos (estimated lateral offset)
-            steer_abs,           # steering_abs
-            heavy_braking,       # heavy_braking
-            full_throttle,       # full_throttle
-            near_edge,           # near track edge flag
-            on_rumble,           # on rumble strip / very near edge
-            track_pos_sign,      # which side of track (-1/0/+1)
+        # Full 14-feature state vector (current layout in loader.py)
+        all_state_features = np.array([
+            state.lap_dist_pct,  # 0: lap_dist_pct
+            speed_norm,          # 1: speed
+            speed_delta,         # 2: speed_delta
+            gear_norm,           # 3: gear
+            rpm_norm,            # 4: rpm
+            lat_g_norm,          # 5: lat_g
+            lon_g_norm,          # 6: lon_g
+            state.track_pos,     # 7: track_pos
+            steer_abs,           # 8: steering_abs
+            heavy_braking,       # 9: heavy_braking
+            full_throttle,       # 10: full_throttle
+            near_edge,           # 11: near_edge (added in track nav update)
+            on_rumble,           # 12: on_rumble (added in track nav update)
+            track_pos_sign,      # 13: track_pos_sign (added in track nav update)
         ], dtype=np.float32)
+
+        # Truncate to match the model's expected state feature count.
+        # Models trained before boundary features were added expect fewer.
+        if n_state_features is not None and n_state_features < len(all_state_features):
+            current_state = all_state_features[:n_state_features]
+        else:
+            current_state = all_state_features
 
         # Action history (newest first), matching HISTORY_ACTIONS order:
         # [throttle, brake, steering, steering_delta] × history_length
