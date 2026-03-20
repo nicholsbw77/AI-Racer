@@ -43,6 +43,7 @@ from inference import DrivingAgent
 from controller import VJoyController, MockController
 from safety_controller import SafetyController
 from track_map import TrackMap
+from manual_override import ManualOverride
 
 
 def setup_logging() -> Path:
@@ -122,6 +123,9 @@ class BotOrchestrator:
             self.controller = MockController()
         else:
             self.controller = VJoyController(device_id=1)
+
+        # Manual keyboard override (F1-F5)
+        self.manual = ManualOverride()
 
         # Metrics
         self._lap_count = 0
@@ -435,8 +439,12 @@ class BotOrchestrator:
         # Start telemetry background thread
         self.telemetry.start()
 
+        # Start manual override key listener
+        self.manual.start()
+
         logger.info("Bot active. Press Ctrl+C to stop.")
         logger.info(f"Target loop rate: {self.cfg['inference']['loop_hz']}Hz")
+        logger.info("Manual override: F1=stop F2=left F3=right F4=gas F5=hand-back")
 
         self._running = True
         self._session_start = time.perf_counter()
@@ -543,6 +551,16 @@ class BotOrchestrator:
                     f"track_pos={state.track_pos:.2f}"
                 )
 
+            # Manual override — bypass model if F-keys active
+            override = self.manual.get_controls()
+            if override is not None:
+                throttle, brake, steering = override
+                if self._frame_count % 60 == 0:
+                    logger.info(
+                        f"MANUAL: thr={throttle:.2f} brk={brake:.2f} "
+                        f"steer={steering:.3f}"
+                    )
+
             # Send to controller
             self.controller.set_inputs(throttle, brake, steering)
 
@@ -619,6 +637,9 @@ class BotOrchestrator:
         logger.info("Releasing controller inputs...")
         self.controller.release()
         self.controller.disconnect()
+
+        logger.info("Stopping manual override listener...")
+        self.manual.stop()
 
         logger.info("Stopping telemetry reader...")
         self.telemetry.stop()
