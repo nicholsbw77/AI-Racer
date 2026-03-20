@@ -29,6 +29,7 @@ training:
   throttle_loss_weight: 1.0
   brake_loss_weight: 1.2    # slightly higher - braking mistakes are costly
   steering_loss_weight: 1.5 # highest - steering errors compound quickly
+  boundary_weight: 0.3      # extra penalty on steering errors near track edges
 
   batch_size: 4096
   epochs: 300
@@ -87,6 +88,18 @@ features:
   # Common values: Mazda MX-5=450deg, GTE=450deg, Formula=270deg
   # Will be auto-detected from data if not set here
   steering_lock_radians: null        # null = auto-detect
+
+safety:
+  # Safety controller — prevents the AI from leaving the track
+  enabled: true
+  edge_warning_threshold: 0.75    # |track_pos| above this triggers gentle correction
+  edge_danger_threshold: 0.90     # |track_pos| above this triggers braking
+  max_lateral_g: 35.0             # m/s² (~3.5g) - reduce throttle above this
+  recovery_steer_gain: 0.5        # how aggressively to steer back toward center
+  recovery_brake: 0.8             # brake force during off-track recovery
+  max_blend_factor: 0.8           # max safety override (keep some model input)
+  off_track_frames_for_recovery: 3  # frames off-track before full recovery
+  speed_limit_ms: null            # optional per-track speed cap (m/s)
 
 paths:
   checkpoints: "checkpoints/"

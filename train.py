@@ -135,6 +135,7 @@ def train_one_combo(
         brake_weight=train_cfg["brake_loss_weight"],
         steering_weight=train_cfg["steering_loss_weight"],
         smoothness_weight=train_cfg["smoothness_weight"],
+        boundary_weight=train_cfg.get("boundary_weight", 0.3),
     )
 
     optimizer = torch.optim.AdamW(
@@ -166,7 +167,7 @@ def train_one_combo(
         # Train
         model.train()
         train_loss_sum = 0.0
-        train_components = {"throttle": 0, "brake": 0, "steering": 0, "smoothness": 0}
+        train_components = {"throttle": 0, "brake": 0, "steering": 0, "smoothness": 0, "boundary": 0}
         t0 = time.time()
 
         for batch_state, batch_action in train_loader:
@@ -180,11 +181,16 @@ def train_one_combo(
             # Use previous steering from history as smoothness reference
             # History index: last steering value is at state[n_state_features + 2]
             # (history is [t-1: throttle, brake, steering, steer_delta, ...])
-            prev_str = batch_state[:, full_dataset.state_arr.shape[1] + 2:
-                                      full_dataset.state_arr.shape[1] + 3]
+            n_state = full_dataset.state_arr.shape[1]
+            prev_str = batch_state[:, n_state + 2:n_state + 3]
+
+            # Extract track_pos from state features (index 7 in STATE_FEATURES)
+            track_pos_idx = 7  # track_pos position in STATE_FEATURES
+            batch_track_pos = batch_state[:, track_pos_idx:track_pos_idx + 1]
 
             loss, components = criterion(
-                pred_thr, pred_brk, pred_str, batch_action, prev_str
+                pred_thr, pred_brk, pred_str, batch_action, prev_str,
+                track_pos=batch_track_pos,
             )
 
             loss.backward()

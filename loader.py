@@ -198,6 +198,17 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     # Steering rate of change (helps smoothness prediction)
     df["steering_delta"] = df["steering"].diff().fillna(0.0).clip(-0.3, 0.3)
 
+    # Track boundary awareness features
+    if "track_pos" in df.columns:
+        track_pos_abs = df["track_pos"].abs()
+        df["near_edge"] = (track_pos_abs > 0.75).astype(float)
+        df["on_rumble"] = (track_pos_abs > 0.90).astype(float)
+        df["track_pos_sign"] = np.sign(df["track_pos"])
+    else:
+        df["near_edge"] = 0.0
+        df["on_rumble"] = 0.0
+        df["track_pos_sign"] = 0.0
+
     return df
 
 
@@ -308,10 +319,13 @@ STATE_FEATURES = [
     "rpm",              # engine RPM (0-1)
     "lat_g",            # lateral G-force
     "lon_g",            # longitudinal G-force
-    "track_pos",        # lateral offset from centerline
+    "track_pos",        # lateral offset from centerline (-1 to +1)
     "steering_abs",     # steering magnitude (cornering context)
     "heavy_braking",    # braking zone flag
     "full_throttle",    # full throttle flag
+    "near_edge",        # approaching track edge (|track_pos| > 0.75)
+    "on_rumble",        # on rumble strip / very near edge (|track_pos| > 0.90)
+    "track_pos_sign",   # which side of track (-1=left, 0=center, +1=right)
 ]
 
 ACTION_FEATURES = [

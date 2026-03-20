@@ -40,6 +40,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from telemetry import TelemetryReader, CarState
 from inference import DrivingAgent
 from controller import VJoyController, MockController
+from safety_controller import SafetyController
 
 
 def setup_logging() -> Path:
@@ -113,6 +114,7 @@ class BotOrchestrator:
             target_hz=cfg["inference"]["loop_hz"]
         )
         self.agent = DrivingAgent(cfg, device=device)
+        self.safety = SafetyController(cfg.get("safety", {}))
 
         if mock:
             self.controller = MockController()
@@ -362,11 +364,17 @@ class BotOrchestrator:
                 car_speed_ms=state.speed,
             )
 
+            # Apply safety controller — corrects outputs near track edges
+            throttle, brake, steering = self.safety.apply(
+                throttle, brake, steering, state
+            )
+
             # Debug: log model outputs periodically
             if self._frame_count % 60 == 0:
                 logger.info(
                     f"Output: thr={throttle:.3f} brk={brake:.3f} "
-                    f"steer={steering:.3f} speed={state.speed:.1f}"
+                    f"steer={steering:.3f} speed={state.speed:.1f} "
+                    f"track_pos={state.track_pos:.2f}"
                 )
 
             # Send to controller
@@ -444,6 +452,17 @@ class BotOrchestrator:
             f"{self._frame_count:,} frames in {elapsed:.1f}s "
             f"(avg {self._frame_count/elapsed:.0f}Hz)"
         )
+
+        # Log safety controller statistics
+        s = self.safety.stats
+        if s.total_frames > 0:
+            logger.info(
+                f"Safety stats: {s.off_track_frames} off-track frames, "
+                f"{s.edge_warning_frames} edge warnings, "
+                f"{s.edge_danger_frames} edge danger frames, "
+                f"{s.recovery_mode_activations} recovery activations "
+                f"(over {s.total_frames} total frames)"
+            )
 
 
 def main():

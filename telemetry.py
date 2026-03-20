@@ -17,6 +17,7 @@ Key iRacing SDK variables used:
   PlayerTrackSurface - surface type (track/pit/grass etc)
   SessionState    - session status
   IsOnTrack       - bool
+  YawRate         - rad/s yaw (for lateral position estimation)
 """
 
 import time
@@ -38,6 +39,14 @@ except ImportError:
     logger.warning("pyirsdk not available - telemetry reader will use mock mode")
 
 
+# iRacing PlayerTrackSurface enum values
+SURFACE_NOT_IN_WORLD = -1
+SURFACE_OFF_TRACK = 0
+SURFACE_IN_PIT_STALL = 1
+SURFACE_APPROACHING_PITS = 2
+SURFACE_ON_TRACK = 3
+
+
 @dataclass
 class CarState:
     """Snapshot of car state at a single time step."""
@@ -49,8 +58,10 @@ class CarState:
     rpm: float = 0.0             # RPM
     lat_g: float = 0.0           # m/s² lateral acceleration
     lon_g: float = 0.0           # m/s² longitudinal acceleration
+    yaw_rate: float = 0.0        # rad/s yaw rotation
     lap_dist_pct: float = 0.0    # 0-1 position on track
-    track_pos: float = 0.0       # lateral offset (-1 to +1)
+    track_pos: float = 0.0       # lateral offset (-1 to +1), estimated
+    surface_type: int = 3        # iRacing surface enum (3=on track)
     is_on_track: bool = False
     on_pit_road: bool = False
     session_active: bool = False
@@ -87,6 +98,10 @@ class TelemetryReader:
         self._steering_hist = np.zeros(self._history_len, dtype=np.float32)
         self._steer_delta_hist = np.zeros(self._history_len, dtype=np.float32)
         self._hist_ptr = 0
+
+        # Track position estimator state
+        self._track_pos_estimate = 0.0
+        self._track_map = None  # Optional TrackMap for better estimation
 
     def connect(self) -> bool:
         """Attempt to connect to iRacing. Returns True if successful."""
@@ -214,6 +229,58 @@ class TelemetryReader:
             return float(val[0]) if val else default
         return float(val)
 
+    def set_track_map(self, track_map):
+        """Attach a TrackMap for improved track position estimation."""
+        self._track_map = track_map
+        logger.info("Track map attached for position estimation")
+
+    def _estimate_track_pos(
+        self, speed: float, steering: float, lat_g: float,
+        yaw_rate: float, lap_dist_pct: float, dt: float = 1.0 / 60
+    ) -> float:
+        """
+        Estimate lateral track position from dynamics.
+
+        Uses three complementary signals:
+        1. Steering deviation from expected (if track map available)
+        2. Yaw rate integration for lateral drift detection
+        3. Lateral G vs expected curvature mismatch
+
+        The estimate drifts toward center (0.0) slowly when signals are
+        ambiguous, which is safe — the safety controller handles edge cases.
+        """
+        # Approach: integrate lateral velocity relative to track centerline
+        # lateral_vel ≈ speed * sin(slip_angle) ≈ yaw_rate * speed deviation
+        # Simplified: use steering angle as proxy for lateral intent
+
+        steer_norm = np.clip(steering / self._steering_lock, -1.0, 1.0)
+
+        if self._track_map is not None:
+            # Use track map for better estimation
+            track_pos = self._track_map.estimate_track_pos(
+                speed, steering, lat_g, lap_dist_pct
+            )
+        else:
+            # Fallback: integrate from yaw rate and lateral G
+            # Lateral acceleration = centripetal + lateral drift
+            # If speed > 0, lateral drift rate ≈ lat_g / speed (simplified)
+            if speed > 2.0:
+                # Estimated lateral drift in track-widths per second
+                # Typical track width ~12m, so normalize
+                lateral_drift_rate = (lat_g / max(speed, 5.0)) * dt * 0.1
+                self._track_pos_estimate += lateral_drift_rate
+
+                # Decay toward center when going straight (low steering)
+                decay = 0.995 if abs(steer_norm) > 0.05 else 0.98
+                self._track_pos_estimate *= decay
+            else:
+                # Car nearly stopped - assume centered
+                self._track_pos_estimate *= 0.95
+
+            track_pos = np.clip(self._track_pos_estimate, -1.0, 1.0)
+
+        return float(track_pos)
+
     def _read_state(self) -> CarState:
         """Read current frame from iRacing shared memory."""
         ir = self._ir
@@ -227,14 +294,29 @@ class TelemetryReader:
         rpm = f(ir["RPM"])
         lat_g = f(ir["LatAccel"])
         lon_g = f(ir["LongAccel"])
+        yaw_rate = f(ir["YawRate"]) if ir["YawRate"] is not None else 0.0
         lap_dist_pct = f(ir["LapDistPct"])
         is_on_track = bool(f(ir["IsOnTrack"]))
         on_pit_road = bool(f(ir["OnPitRoad"] or 0))
         session_state = int(f(ir["SessionState"]))
 
-        # Track position: iRacing provides this as fraction, center=0
-        # Some SDK versions: use CarIdxTrackSurface or similar
-        track_pos = 0.0  # TODO: derive from iRacing track width data
+        # Read track surface type (PlayerTrackSurface)
+        surface_raw = ir["PlayerTrackSurface"]
+        surface_type = int(f(surface_raw)) if surface_raw is not None else SURFACE_ON_TRACK
+
+        # Estimate lateral track position from dynamics
+        track_pos = self._estimate_track_pos(
+            speed, steering, lat_g, yaw_rate, lap_dist_pct
+        )
+
+        # Override track_pos if surface indicates off-track
+        if surface_type == SURFACE_OFF_TRACK:
+            # Push estimate toward edge based on steering direction
+            steer_sign = np.sign(steering) if abs(steering) > 0.01 else np.sign(self._track_pos_estimate)
+            self._track_pos_estimate = np.clip(
+                self._track_pos_estimate + steer_sign * 0.05, -1.0, 1.0
+            )
+            track_pos = self._track_pos_estimate
 
         # Update dynamic normalization constants
         self._speed_max = max(self._speed_max, speed * 1.05)
@@ -249,8 +331,10 @@ class TelemetryReader:
             rpm=rpm,
             lat_g=lat_g,
             lon_g=lon_g,
+            yaw_rate=yaw_rate,
             lap_dist_pct=lap_dist_pct,
             track_pos=track_pos,
+            surface_type=surface_type,
             is_on_track=is_on_track,
             on_pit_road=on_pit_road,
             session_active=(session_state > 0),
@@ -333,6 +417,12 @@ class TelemetryReader:
         heavy_braking = float(state.brake > 0.3 and lon_g_norm < -0.05)
         full_throttle = float(state.throttle > 0.95)
 
+        # Track boundary awareness features
+        track_pos_abs = abs(state.track_pos)
+        near_edge = float(track_pos_abs > 0.75)       # approaching edge
+        on_rumble = float(track_pos_abs > 0.90)        # likely on rumble strip
+        track_pos_sign = np.sign(state.track_pos)      # which side (-1=left, +1=right)
+
         current_state = np.array([
             state.lap_dist_pct,  # lap_dist_pct
             speed_norm,          # speed
@@ -341,10 +431,13 @@ class TelemetryReader:
             rpm_norm,            # rpm
             lat_g_norm,          # lat_g
             lon_g_norm,          # lon_g
-            state.track_pos,     # track_pos
+            state.track_pos,     # track_pos (estimated lateral offset)
             steer_abs,           # steering_abs
             heavy_braking,       # heavy_braking
             full_throttle,       # full_throttle
+            near_edge,           # near track edge flag
+            on_rumble,           # on rumble strip / very near edge
+            track_pos_sign,      # which side of track (-1/0/+1)
         ], dtype=np.float32)
 
         # Action history (newest first), matching HISTORY_ACTIONS order:

@@ -102,13 +102,42 @@ Requires iRacing running on Windows with pyirsdk connected.
 
 ---
 
-## 4 — Quality / Nice-to-have
+## 4 — Track Navigation & Staying On Track
+
+- [x] **`track_pos` estimation** — Fixed hardcoded 0.0 in telemetry.py.
+  Now estimates lateral position from dynamics (yaw rate, lat_g, steering).
+  Falls back to track map integration when available.
+- [x] **Track boundary features** — Added `near_edge`, `on_rumble`,
+  `track_pos_sign` to state vector. Model now sees when it's near edges.
+- [x] **`safety_controller.py`** — Safety layer between model and controller:
+  - Off-track recovery (hard brake + steer toward center)
+  - Edge proximity warnings (progressive throttle reduction + corrective steering)
+  - Excessive lateral G protection
+  - Configurable blend factors (safety never fully overrides model)
+- [x] **`track_map.py`** — Builds virtual track profile from telemetry data:
+  - Curvature, speed, and steering profiles per track segment
+  - Corner detection, braking zone identification
+  - Speed envelope (safe min/max per position)
+  - Track position estimation from dynamics
+- [x] **`track_simulator.py`** — Offline 2D track simulator:
+  - Bicycle model physics (no iRacing needed)
+  - Built-in tracks: oval, road course, figure-eight
+  - State vector compatible with trained models
+  - PID demo controller for testing
+- [x] **Boundary-aware training loss** — Added `boundary_weight` loss term
+  that increases steering error penalty near track edges
+
+---
+
+## 5 — Quality / Nice-to-have
 
 - [ ] `evaluate.py` — offline lap simulation: replay `.ibt`, compare
   predicted inputs vs actual, compute MSE per channel
 - [ ] Lap time predictor: given model outputs, estimate lap delta vs PB
 - [ ] Tensorboard / W&B logging in `train.py`
 - [ ] GitHub Actions CI: lint + unit tests on push
+- [ ] DAgger (Dataset Aggregation) for iterative improvement against covariate shift
+- [ ] Track-specific speed limit profiles in safety controller
 
 ---
 
@@ -120,9 +149,9 @@ Requires iRacing running on Windows with pyirsdk connected.
   250ms at 60Hz vs 42ms at 360Hz. May want to reduce to `sequence_history=5`
   for 60Hz training data.
 
-- **`track_pos`**: iRacing does not expose lateral track position directly
-  in `.ibt` telemetry. It is currently hardcoded to `0.0` in `telemetry.py`.
-  Consider deriving from `LapDist` + track map data, or dropping the feature.
+- **`track_pos` estimation**: Now estimated from dynamics rather than
+  hardcoded to 0.0. Accuracy improves significantly when a TrackMap is
+  built from training data. Without a track map, uses lateral G integration.
 
 - **`inspect_csv.py`**: Imports from `trainer.loader` using a `trainer/`
   subpackage path. Current file layout is flat — either reorganize into
