@@ -150,6 +150,8 @@ class BotOrchestrator:
             "turn_throttle": 0.35,
             "straight_throttle": 0.40,
             "ramp_duration": 3.0,
+            "cruise_until_lap_pct": 0.15,
+            "cruise_throttle": 0.5,
         }
         cfg_path = Path(__file__).parent / "pit_exit_config.json"
         if cfg_path.exists():
@@ -235,9 +237,27 @@ class BotOrchestrator:
                         )
                     return throttle, brake, steering
                 else:
+                    # Cruise phase: keep driving with lat_g steering correction
+                    # until we reach a part of the track the model knows
+                    cruise_target = pcfg.get("cruise_until_lap_pct", 0.15)
+                    cruise_thr = pcfg.get("cruise_throttle", 0.5)
+                    if state.lap_dist_pct < cruise_target:
+                        steer_correction = -state.lat_g * 0.005
+                        steering = max(-0.3, min(0.3, steer_correction))
+                        throttle = cruise_thr
+                        brake = 0.0
+                        if self._frame_count % 60 == 0:
+                            logger.info(
+                                f"PIT EXIT CRUISE: steer={steering:.3f} thr={throttle:.2f} "
+                                f"speed={state.speed:.1f}m/s lap_pct={state.lap_dist_pct:.3f} "
+                                f"target={cruise_target:.3f}"
+                            )
+                        return throttle, brake, steering
+
                     logger.info(
                         f"Pit exit complete — handing off to model at "
-                        f"speed={state.speed:.1f}m/s track_pos={state.track_pos:.2f}"
+                        f"speed={state.speed:.1f}m/s lap_pct={state.lap_dist_pct:.3f} "
+                        f"track_pos={state.track_pos:.2f}"
                     )
                     self._pit_exit_turn_start = None
                     # Reset track position estimate to center so the model

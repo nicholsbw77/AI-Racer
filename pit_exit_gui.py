@@ -28,6 +28,8 @@ DEFAULTS = {
     "turn_throttle": 0.35,       # throttle during turn
     "straight_throttle": 0.40,   # throttle during straight
     "ramp_duration": 3.0,        # seconds to blend from turn to model handoff
+    "cruise_until_lap_pct": 0.15, # keep autopilot until this lap %
+    "cruise_throttle": 0.50,     # throttle during cruise phase
 }
 
 
@@ -139,6 +141,32 @@ class PitExitGUI(QWidget):
         ramp_group.setLayout(rg)
         layout.addWidget(ramp_group)
 
+        # --- Cruise Phase ---
+        cruise_group = QGroupBox("Cruise Phase (post-merge)")
+        cg = QGridLayout()
+
+        cg.addWidget(QLabel("Cruise until lap %:"), 0, 0)
+        self.cruise_pct = QDoubleSpinBox()
+        self.cruise_pct.setRange(0.0, 1.0)
+        self.cruise_pct.setSingleStep(0.01)
+        self.cruise_pct.setDecimals(3)
+        self.cruise_pct.setValue(cfg.get("cruise_until_lap_pct", 0.15))
+        cg.addWidget(self.cruise_pct, 0, 1)
+        cruise_hint = QLabel("autopilot stays active until this lap %")
+        cruise_hint.setStyleSheet("color: gray; font-size: 10px;")
+        cg.addWidget(cruise_hint, 0, 2)
+
+        cg.addWidget(QLabel("Cruise throttle:"), 1, 0)
+        self.cruise_thr = QDoubleSpinBox()
+        self.cruise_thr.setRange(0.0, 1.0)
+        self.cruise_thr.setSingleStep(0.05)
+        self.cruise_thr.setDecimals(2)
+        self.cruise_thr.setValue(cfg.get("cruise_throttle", 0.50))
+        cg.addWidget(self.cruise_thr, 1, 1)
+
+        cruise_group.setLayout(cg)
+        layout.addWidget(cruise_group)
+
         # --- Buttons ---
         btn_layout = QHBoxLayout()
         save_btn = QPushButton("Save")
@@ -167,6 +195,8 @@ class PitExitGUI(QWidget):
             "turn_throttle": self.turn_thr.value(),
             "straight_throttle": self.straight_thr.value(),
             "ramp_duration": self.ramp_dur.value(),
+            "cruise_until_lap_pct": self.cruise_pct.value(),
+            "cruise_throttle": self.cruise_thr.value(),
         }
         save_config(cfg)
         self.status.setText(f"Saved to {CONFIG_PATH.name}")
@@ -179,6 +209,8 @@ class PitExitGUI(QWidget):
         self.turn_thr.setValue(DEFAULTS["turn_throttle"])
         self.straight_thr.setValue(DEFAULTS["straight_throttle"])
         self.ramp_dur.setValue(DEFAULTS["ramp_duration"])
+        self.cruise_pct.setValue(DEFAULTS["cruise_until_lap_pct"])
+        self.cruise_thr.setValue(DEFAULTS["cruise_throttle"])
         self.status.setText("Reset to defaults (not saved yet)")
         QTimer.singleShot(3000, lambda: self.status.setText(""))
 
