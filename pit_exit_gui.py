@@ -31,6 +31,10 @@ DEFAULTS = {
     "cruise_until_lap_pct": 0.15, # keep autopilot until this lap %
     "cruise_throttle": 0.50,     # throttle during cruise phase
     "pit_exit_track_pos": 0.60,  # known track offset at pit exit (+ = right of line)
+    "stall_pullout_left_dur": 1.2,    # seconds turning left out of stall
+    "stall_pullout_right_dur": 0.8,   # seconds turning right to straighten
+    "stall_pullout_steer": 0.35,      # steering magnitude for pullout
+    "stall_pullout_throttle": 0.35,   # gentle throttle during pullout
 }
 
 
@@ -66,6 +70,49 @@ class PitExitGUI(QWidget):
         title.setFont(QFont("", 14, QFont.Bold))
         title.setAlignment(Qt.AlignCenter)
         layout.addWidget(title)
+
+        # --- Stall Pullout Phase ---
+        pullout_group = QGroupBox("Stall Pullout (leave pit box)")
+        pg = QGridLayout()
+
+        pg.addWidget(QLabel("Left turn duration (sec):"), 0, 0)
+        self.pullout_left_dur = QDoubleSpinBox()
+        self.pullout_left_dur.setRange(0.0, 5.0)
+        self.pullout_left_dur.setSingleStep(0.1)
+        self.pullout_left_dur.setDecimals(1)
+        self.pullout_left_dur.setValue(cfg.get("stall_pullout_left_dur", 1.2))
+        pg.addWidget(self.pullout_left_dur, 0, 1)
+
+        pg.addWidget(QLabel("Right turn duration (sec):"), 1, 0)
+        self.pullout_right_dur = QDoubleSpinBox()
+        self.pullout_right_dur.setRange(0.0, 5.0)
+        self.pullout_right_dur.setSingleStep(0.1)
+        self.pullout_right_dur.setDecimals(1)
+        self.pullout_right_dur.setValue(cfg.get("stall_pullout_right_dur", 0.8))
+        pg.addWidget(self.pullout_right_dur, 1, 1)
+
+        pg.addWidget(QLabel("Steering amount:"), 2, 0)
+        self.pullout_steer = QDoubleSpinBox()
+        self.pullout_steer.setRange(0.0, 1.0)
+        self.pullout_steer.setSingleStep(0.05)
+        self.pullout_steer.setDecimals(2)
+        self.pullout_steer.setValue(cfg.get("stall_pullout_steer", 0.35))
+        pg.addWidget(self.pullout_steer, 2, 1)
+
+        pg.addWidget(QLabel("Pullout throttle:"), 3, 0)
+        self.pullout_throttle = QDoubleSpinBox()
+        self.pullout_throttle.setRange(0.0, 1.0)
+        self.pullout_throttle.setSingleStep(0.05)
+        self.pullout_throttle.setDecimals(2)
+        self.pullout_throttle.setValue(cfg.get("stall_pullout_throttle", 0.35))
+        pg.addWidget(self.pullout_throttle, 3, 1)
+
+        pullout_hint = QLabel("swerve left then right to clear pit stall wall")
+        pullout_hint.setStyleSheet("color: gray; font-size: 10px;")
+        pg.addWidget(pullout_hint, 4, 0, 1, 3)
+
+        pullout_group.setLayout(pg)
+        layout.addWidget(pullout_group)
 
         # --- Straight Phase ---
         straight_group = QGroupBox("Straight Phase")
@@ -210,6 +257,10 @@ class PitExitGUI(QWidget):
             "cruise_until_lap_pct": self.cruise_pct.value(),
             "cruise_throttle": self.cruise_thr.value(),
             "pit_exit_track_pos": self.pit_track_pos.value(),
+            "stall_pullout_left_dur": self.pullout_left_dur.value(),
+            "stall_pullout_right_dur": self.pullout_right_dur.value(),
+            "stall_pullout_steer": self.pullout_steer.value(),
+            "stall_pullout_throttle": self.pullout_throttle.value(),
         }
         save_config(cfg)
         self.status.setText(f"Saved to {CONFIG_PATH.name}")
@@ -225,6 +276,10 @@ class PitExitGUI(QWidget):
         self.cruise_pct.setValue(DEFAULTS["cruise_until_lap_pct"])
         self.cruise_thr.setValue(DEFAULTS["cruise_throttle"])
         self.pit_track_pos.setValue(DEFAULTS["pit_exit_track_pos"])
+        self.pullout_left_dur.setValue(DEFAULTS["stall_pullout_left_dur"])
+        self.pullout_right_dur.setValue(DEFAULTS["stall_pullout_right_dur"])
+        self.pullout_steer.setValue(DEFAULTS["stall_pullout_steer"])
+        self.pullout_throttle.setValue(DEFAULTS["stall_pullout_throttle"])
         self.status.setText("Reset to defaults (not saved yet)")
         QTimer.singleShot(3000, lambda: self.status.setText(""))
 

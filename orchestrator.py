@@ -138,6 +138,8 @@ class BotOrchestrator:
         self._pit_exit_active = False
         self._pit_exit_logged = False
         self._pit_exit_turn_start = None  # timestamp for post-pit-exit turn
+        self._pit_stall_pullout_start = None  # timestamp for stall pullout maneuver
+        self._pit_stall_pullout_done = False   # True once pullout swerve is finished
         self._pit_exit_cfg = self._load_pit_exit_config()
 
         # Register Ctrl+C handler
@@ -157,6 +159,10 @@ class BotOrchestrator:
             "cruise_until_lap_pct": 0.20,
             "cruise_throttle": 0.5,
             "pit_exit_track_pos": 0.6,  # known offset from racing line at pit exit
+            "stall_pullout_left_dur": 1.2,    # seconds turning left out of stall
+            "stall_pullout_right_dur": 0.8,   # seconds turning right to straighten
+            "stall_pullout_steer": 0.35,      # steering magnitude for pullout
+            "stall_pullout_throttle": 0.35,   # gentle throttle during pullout
         }
         cfg_path = Path(__file__).parent / "pit_exit_config.json"
         if cfg_path.exists():
@@ -299,14 +305,73 @@ class BotOrchestrator:
 
         if not self._pit_exit_active:
             self._pit_exit_active = True
+            self._pit_stall_pullout_start = None
+            self._pit_stall_pullout_done = False
             logger.info("Pit exit autopilot engaged")
+
+        # Shift to 1st if needed, then 2nd once rolling
+        if state.speed < 5.0:
+            target_gear = 1
+        else:
+            target_gear = 2
+        if target_gear != self.controller._current_gear:
+            self.controller.shift_to(target_gear)
 
         # Pit speed limit is typically 60-80 km/h (16-22 m/s)
         PIT_SPEED_LIMIT = 18.0  # m/s (~65 km/h), safe for most tracks
 
+        # --- Phase 0: Stall pullout (left swerve then right to straighten) ---
+        if not self._pit_stall_pullout_done:
+            pcfg = self._pit_exit_cfg
+            left_dur = pcfg.get("stall_pullout_left_dur", 1.2)
+            right_dur = pcfg.get("stall_pullout_right_dur", 0.8)
+            pullout_steer = pcfg.get("stall_pullout_steer", 0.35)
+            pullout_thr = pcfg.get("stall_pullout_throttle", 0.35)
+
+            # Start the pullout timer once the car begins rolling
+            if state.speed > 0.5 and self._pit_stall_pullout_start is None:
+                self._pit_stall_pullout_start = time.perf_counter()
+                logger.info("Pit stall pullout: car rolling, starting left swerve")
+
+            if self._pit_stall_pullout_start is not None:
+                elapsed = time.perf_counter() - self._pit_stall_pullout_start
+
+                if elapsed < left_dur:
+                    # Turn left to pull out of stall (one car width)
+                    steering = -pullout_steer
+                    throttle = pullout_thr
+                    brake = 0.0
+                    if self._frame_count % 30 == 0:
+                        logger.info(
+                            f"PIT STALL LEFT: steer={steering:.3f} thr={throttle:.2f} "
+                            f"elapsed={elapsed:.1f}/{left_dur:.1f}s speed={state.speed:.1f}m/s"
+                        )
+                    return throttle, brake, steering
+
+                elif elapsed < left_dur + right_dur:
+                    # Turn right to straighten on pit road
+                    steering = pullout_steer
+                    throttle = pullout_thr
+                    brake = 0.0
+                    if self._frame_count % 30 == 0:
+                        logger.info(
+                            f"PIT STALL RIGHT: steer={steering:.3f} thr={throttle:.2f} "
+                            f"elapsed={elapsed - left_dur:.1f}/{right_dur:.1f}s speed={state.speed:.1f}m/s"
+                        )
+                    return throttle, brake, steering
+
+                else:
+                    # Pullout done — continue with normal pit road driving
+                    self._pit_stall_pullout_done = True
+                    logger.info("Pit stall pullout complete, driving down pit road")
+            else:
+                # Not rolling yet — apply throttle to get moving
+                return 0.5, 0.0, 0.0
+
+        # --- Phase 1: Normal pit road driving (straight with speed limit) ---
+
         # Gentle throttle to get moving, back off near speed limit
         if state.speed < 2.0:
-            # Starting from standstill — need more throttle to get rolling
             throttle = 0.5
         elif state.speed < PIT_SPEED_LIMIT * 0.8:
             throttle = 0.4
@@ -318,19 +383,8 @@ class BotOrchestrator:
         brake = 0.0
 
         # Minimal steering correction using lateral G
-        # If car drifts left (negative lat_g), steer slightly right
-        # Gain is very small — pit lanes are straight, we just nudge
         steer_correction = -state.lat_g * 0.005
         steering = max(-0.15, min(0.15, steer_correction))
-
-        # Shift to 1st if needed, then 2nd once rolling
-        if state.speed < 5.0:
-            target_gear = 1
-        else:
-            target_gear = 2
-
-        if target_gear != self.controller._current_gear:
-            self.controller.shift_to(target_gear)
 
         if self._frame_count % 60 == 0:
             logger.info(
