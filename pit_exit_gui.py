@@ -1,0 +1,169 @@
+"""
+pit_exit_gui.py
+
+PyQt5 GUI to configure pit exit autopilot parameters.
+Saves settings to pit_exit_config.json, which the orchestrator reads at runtime.
+
+Usage:
+  python pit_exit_gui.py
+"""
+
+import json
+import sys
+from pathlib import Path
+
+from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtGui import QFont
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
+    QLabel, QDoubleSpinBox, QPushButton, QFrame, QGroupBox,
+)
+
+CONFIG_PATH = Path(__file__).parent / "pit_exit_config.json"
+
+DEFAULTS = {
+    "straight_duration": 8.0,    # seconds to drive straight after pit exit
+    "turn_angle": -60.0,         # degrees (negative = left, positive = right)
+    "turn_duration": 1.5,        # seconds to hold the turn
+    "turn_throttle": 0.35,       # throttle during turn
+    "straight_throttle": 0.40,   # throttle during straight
+}
+
+
+def load_config() -> dict:
+    if CONFIG_PATH.exists():
+        try:
+            with open(CONFIG_PATH) as f:
+                saved = json.load(f)
+            return {**DEFAULTS, **saved}
+        except (json.JSONDecodeError, IOError):
+            pass
+    return dict(DEFAULTS)
+
+
+def save_config(cfg: dict):
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(cfg, f, indent=2)
+
+
+class PitExitGUI(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Pit Exit Autopilot Config")
+        self.setFixedWidth(420)
+
+        cfg = load_config()
+
+        layout = QVBoxLayout()
+        layout.setSpacing(10)
+
+        # Title
+        title = QLabel("Pit Exit Autopilot")
+        title.setFont(QFont("", 14, QFont.Bold))
+        title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title)
+
+        # --- Straight Phase ---
+        straight_group = QGroupBox("Straight Phase")
+        sg = QGridLayout()
+
+        sg.addWidget(QLabel("Time before turn (sec):"), 0, 0)
+        self.straight_dur = QDoubleSpinBox()
+        self.straight_dur.setRange(0.0, 60.0)
+        self.straight_dur.setSingleStep(0.5)
+        self.straight_dur.setDecimals(1)
+        self.straight_dur.setValue(cfg["straight_duration"])
+        sg.addWidget(self.straight_dur, 0, 1)
+
+        sg.addWidget(QLabel("Straight throttle:"), 1, 0)
+        self.straight_thr = QDoubleSpinBox()
+        self.straight_thr.setRange(0.0, 1.0)
+        self.straight_thr.setSingleStep(0.05)
+        self.straight_thr.setDecimals(2)
+        self.straight_thr.setValue(cfg["straight_throttle"])
+        sg.addWidget(self.straight_thr, 1, 1)
+
+        straight_group.setLayout(sg)
+        layout.addWidget(straight_group)
+
+        # --- Turn Phase ---
+        turn_group = QGroupBox("Turn Phase")
+        tg = QGridLayout()
+
+        tg.addWidget(QLabel("Steering angle (deg):"), 0, 0)
+        self.turn_angle = QDoubleSpinBox()
+        self.turn_angle.setRange(-180.0, 180.0)
+        self.turn_angle.setSingleStep(5.0)
+        self.turn_angle.setDecimals(1)
+        self.turn_angle.setValue(cfg["turn_angle"])
+        tg.addWidget(self.turn_angle, 0, 1)
+        hint = QLabel("negative = left, positive = right")
+        hint.setStyleSheet("color: gray; font-size: 10px;")
+        tg.addWidget(hint, 0, 2)
+
+        tg.addWidget(QLabel("Turn duration (sec):"), 1, 0)
+        self.turn_dur = QDoubleSpinBox()
+        self.turn_dur.setRange(0.1, 10.0)
+        self.turn_dur.setSingleStep(0.1)
+        self.turn_dur.setDecimals(1)
+        self.turn_dur.setValue(cfg["turn_duration"])
+        tg.addWidget(self.turn_dur, 1, 1)
+
+        tg.addWidget(QLabel("Turn throttle:"), 2, 0)
+        self.turn_thr = QDoubleSpinBox()
+        self.turn_thr.setRange(0.0, 1.0)
+        self.turn_thr.setSingleStep(0.05)
+        self.turn_thr.setDecimals(2)
+        self.turn_thr.setValue(cfg["turn_throttle"])
+        tg.addWidget(self.turn_thr, 2, 1)
+
+        turn_group.setLayout(tg)
+        layout.addWidget(turn_group)
+
+        # --- Buttons ---
+        btn_layout = QHBoxLayout()
+        save_btn = QPushButton("Save")
+        save_btn.clicked.connect(self._save)
+        btn_layout.addWidget(save_btn)
+
+        reset_btn = QPushButton("Reset Defaults")
+        reset_btn.clicked.connect(self._reset)
+        btn_layout.addWidget(reset_btn)
+
+        layout.addLayout(btn_layout)
+
+        # Status label
+        self.status = QLabel("")
+        self.status.setStyleSheet("color: green;")
+        self.status.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.status)
+
+        self.setLayout(layout)
+
+    def _save(self):
+        cfg = {
+            "straight_duration": self.straight_dur.value(),
+            "turn_angle": self.turn_angle.value(),
+            "turn_duration": self.turn_dur.value(),
+            "turn_throttle": self.turn_thr.value(),
+            "straight_throttle": self.straight_thr.value(),
+        }
+        save_config(cfg)
+        self.status.setText(f"Saved to {CONFIG_PATH.name}")
+        QTimer.singleShot(3000, lambda: self.status.setText(""))
+
+    def _reset(self):
+        self.straight_dur.setValue(DEFAULTS["straight_duration"])
+        self.turn_angle.setValue(DEFAULTS["turn_angle"])
+        self.turn_dur.setValue(DEFAULTS["turn_duration"])
+        self.turn_thr.setValue(DEFAULTS["turn_throttle"])
+        self.straight_thr.setValue(DEFAULTS["straight_throttle"])
+        self.status.setText("Reset to defaults (not saved yet)")
+        QTimer.singleShot(3000, lambda: self.status.setText(""))
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = PitExitGUI()
+    window.show()
+    sys.exit(app.exec_())

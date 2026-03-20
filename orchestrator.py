@@ -30,6 +30,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+import json
 import numpy as np
 import yaml
 import torch
@@ -133,10 +134,34 @@ class BotOrchestrator:
         self._pit_exit_active = False
         self._pit_exit_logged = False
         self._pit_exit_turn_start = None  # timestamp for post-pit-exit turn
+        self._pit_exit_cfg = self._load_pit_exit_config()
 
         # Register Ctrl+C handler
         signal.signal(signal.SIGINT, self._shutdown_handler)
         signal.signal(signal.SIGTERM, self._shutdown_handler)
+
+    @staticmethod
+    def _load_pit_exit_config() -> dict:
+        """Load pit exit config from GUI-generated JSON, with defaults."""
+        defaults = {
+            "straight_duration": 8.0,
+            "turn_angle": -60.0,
+            "turn_duration": 1.5,
+            "turn_throttle": 0.35,
+            "straight_throttle": 0.40,
+        }
+        cfg_path = Path(__file__).parent / "pit_exit_config.json"
+        if cfg_path.exists():
+            try:
+                with open(cfg_path) as f:
+                    saved = json.load(f)
+                merged = {**defaults, **saved}
+                logger.info(f"Loaded pit exit config: {merged}")
+                return merged
+            except (json.JSONDecodeError, IOError):
+                pass
+        logger.info(f"Using default pit exit config: {defaults}")
+        return defaults
 
     def _pit_exit_autopilot(self, state) -> tuple:
         """
@@ -158,30 +183,35 @@ class BotOrchestrator:
                 self._pit_exit_turn_start = time.perf_counter()
                 logger.info("Pit exit: off pit road, starting left turn merge")
 
-            # Post-pit-exit: drive straight 15s, then left turn for 1.5s
+            # Post-pit-exit: drive straight, then turn (config from pit_exit_config.json)
             if self._pit_exit_turn_start is not None:
+                pcfg = self._pit_exit_cfg
+                straight_dur = pcfg["straight_duration"]
+                turn_dur = pcfg["turn_duration"]
+                # Convert angle in degrees to steering ratio (-1 to 1)
+                # Assume ~180 deg max lock, so divide by 180
+                turn_steering = max(-1.0, min(1.0, pcfg["turn_angle"] / 180.0))
+
                 elapsed = time.perf_counter() - self._pit_exit_turn_start
-                if elapsed < 12.0:
-                    # Drive straight for 12 seconds after pit exit line
+                if elapsed < straight_dur:
                     steer_correction = -state.lat_g * 0.005
                     steering = max(-0.15, min(0.15, steer_correction))
-                    throttle = 0.4
+                    throttle = pcfg["straight_throttle"]
                     brake = 0.0
                     if int(elapsed * 10) % 50 == 0:
                         logger.info(
                             f"PIT EXIT STRAIGHT: steer={steering:.3f} thr={throttle:.2f} "
-                            f"elapsed={elapsed:.1f}s speed={state.speed:.1f}m/s"
+                            f"elapsed={elapsed:.1f}/{straight_dur:.1f}s speed={state.speed:.1f}m/s"
                         )
                     return throttle, brake, steering
-                elif elapsed < 13.5:
-                    # Left turn ~60 degrees for 1.5 seconds
-                    steering = -0.33  # left turn (~60 deg)
-                    throttle = 0.35   # moderate throttle through the turn
+                elif elapsed < straight_dur + turn_dur:
+                    steering = turn_steering
+                    throttle = pcfg["turn_throttle"]
                     brake = 0.0
                     if int(elapsed * 10) % 5 == 0:
                         logger.info(
                             f"PIT EXIT TURN: steer={steering:.2f} thr={throttle:.2f} "
-                            f"elapsed={elapsed:.1f}s speed={state.speed:.1f}m/s"
+                            f"elapsed={elapsed - straight_dur:.1f}/{turn_dur:.1f}s speed={state.speed:.1f}m/s"
                         )
                     return throttle, brake, steering
                 else:
