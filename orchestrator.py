@@ -261,12 +261,17 @@ class BotOrchestrator:
                         track_map = getattr(self.telemetry, '_track_map', None)
                         if track_map is not None:
                             bin_data = track_map._get_bin(state.lap_dist_pct)
-                            # Follow the racing line: use typical steering
-                            # with a small lat_g correction on top
                             base_steer = bin_data.typical_steering
                             lat_g_correction = -state.lat_g * 0.003
-                            steering = base_steer + lat_g_correction
+
+                            # Correct for lateral offset from racing line.
+                            # track_pos > 0 means right of line → steer left
+                            # (subtract proportional correction).
+                            # Gain of 0.4 means track_pos=0.6 → -0.24 correction
+                            track_pos_correction = -state.track_pos * 0.4
+                            steering = base_steer + lat_g_correction + track_pos_correction
                             steering = max(-0.5, min(0.5, steering))
+
                             # Also match typical speed — use track map speed
                             typical_speed = bin_data.typical_speed
                             if state.speed < typical_speed * 0.8:
@@ -276,8 +281,9 @@ class BotOrchestrator:
                             else:
                                 throttle = cruise_thr
                         else:
-                            # Fallback: lat_g correction only
-                            steer_correction = -state.lat_g * 0.005
+                            # Fallback: lat_g + track_pos correction
+                            track_pos_correction = -state.track_pos * 0.4
+                            steer_correction = -state.lat_g * 0.005 + track_pos_correction
                             steering = max(-0.3, min(0.3, steer_correction))
                             throttle = cruise_thr
                         brake = 0.0
@@ -285,7 +291,7 @@ class BotOrchestrator:
                             logger.info(
                                 f"PIT EXIT CRUISE: steer={steering:.3f} thr={throttle:.2f} "
                                 f"speed={state.speed:.1f}m/s lap_pct={state.lap_dist_pct:.3f} "
-                                f"target={cruise_target:.3f}"
+                                f"track_pos={state.track_pos:.2f} target={cruise_target:.3f}"
                             )
                         return throttle, brake, steering
 
