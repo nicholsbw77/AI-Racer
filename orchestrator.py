@@ -150,7 +150,7 @@ class BotOrchestrator:
             "turn_throttle": 0.35,
             "straight_throttle": 0.40,
             "ramp_duration": 3.0,
-            "cruise_until_lap_pct": 0.15,
+            "cruise_until_lap_pct": 0.20,
             "cruise_throttle": 0.5,
         }
         cfg_path = Path(__file__).parent / "pit_exit_config.json"
@@ -237,14 +237,34 @@ class BotOrchestrator:
                         )
                     return throttle, brake, steering
                 else:
-                    # Cruise phase: keep driving with lat_g steering correction
-                    # until we reach a part of the track the model knows
+                    # Cruise phase: follow the racing line using track map data
+                    # until we reach a part of the track where the model can take over
                     cruise_target = pcfg.get("cruise_until_lap_pct", 0.15)
                     cruise_thr = pcfg.get("cruise_throttle", 0.5)
                     if state.lap_dist_pct < cruise_target:
-                        steer_correction = -state.lat_g * 0.005
-                        steering = max(-0.3, min(0.3, steer_correction))
-                        throttle = cruise_thr
+                        # Use track map typical steering as base if available
+                        track_map = getattr(self.telemetry, '_track_map', None)
+                        if track_map is not None:
+                            bin_data = track_map._get_bin(state.lap_dist_pct)
+                            # Follow the racing line: use typical steering
+                            # with a small lat_g correction on top
+                            base_steer = bin_data.typical_steering
+                            lat_g_correction = -state.lat_g * 0.003
+                            steering = base_steer + lat_g_correction
+                            steering = max(-0.5, min(0.5, steering))
+                            # Also match typical speed — use track map speed
+                            typical_speed = bin_data.typical_speed
+                            if state.speed < typical_speed * 0.8:
+                                throttle = min(cruise_thr + 0.1, 0.7)
+                            elif state.speed > typical_speed * 1.1:
+                                throttle = 0.1
+                            else:
+                                throttle = cruise_thr
+                        else:
+                            # Fallback: lat_g correction only
+                            steer_correction = -state.lat_g * 0.005
+                            steering = max(-0.3, min(0.3, steer_correction))
+                            throttle = cruise_thr
                         brake = 0.0
                         if self._frame_count % 60 == 0:
                             logger.info(
