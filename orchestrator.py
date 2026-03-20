@@ -161,8 +161,8 @@ class BotOrchestrator:
             # Post-pit-exit: drive straight 15s, then left turn for 1.5s
             if self._pit_exit_turn_start is not None:
                 elapsed = time.perf_counter() - self._pit_exit_turn_start
-                if elapsed < 15.0:
-                    # Drive straight for 15 seconds after pit exit line
+                if elapsed < 12.0:
+                    # Drive straight for 12 seconds after pit exit line
                     steer_correction = -state.lat_g * 0.005
                     steering = max(-0.15, min(0.15, steer_correction))
                     throttle = 0.4
@@ -173,7 +173,7 @@ class BotOrchestrator:
                             f"elapsed={elapsed:.1f}s speed={state.speed:.1f}m/s"
                         )
                     return throttle, brake, steering
-                elif elapsed < 16.5:
+                elif elapsed < 13.5:
                     # Left turn ~60 degrees for 1.5 seconds
                     steering = -0.33  # left turn (~60 deg)
                     throttle = 0.35   # moderate throttle through the turn
