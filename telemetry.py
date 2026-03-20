@@ -259,7 +259,7 @@ class TelemetryReader:
         if self._track_map is not None:
             # Use track map for better estimation
             track_pos = self._track_map.estimate_track_pos(
-                speed, steering, lat_g, lap_dist_pct
+                lap_dist_pct, speed, steering, lat_g
             )
         else:
             # Fallback: integrate from yaw rate and lateral G
