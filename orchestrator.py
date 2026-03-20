@@ -286,7 +286,7 @@ class BotOrchestrator:
             self.telemetry._rpm_max = norm["rpm_max"]
 
         # Load track map if available
-        checkpoint_dir = Path(cfg["paths"]["checkpoints"]) / combo_name
+        checkpoint_dir = Path(self.cfg["paths"]["checkpoints"]) / combo_name
         track_map_path = checkpoint_dir / "track_map.json"
         if track_map_path.exists():
             try:

@@ -74,7 +74,7 @@ class DrivingAgent:
             return False
 
         try:
-            ckpt = torch.load(best_path, map_location=self.device)
+            ckpt = torch.load(best_path, map_location=self.device, weights_only=False)
             model_cfg = ckpt["cfg"]["model"]
 
             self.model = DrivingPolicyNet(
