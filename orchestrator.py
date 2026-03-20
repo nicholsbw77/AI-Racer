@@ -152,6 +152,7 @@ class BotOrchestrator:
             "ramp_duration": 3.0,
             "cruise_until_lap_pct": 0.20,
             "cruise_throttle": 0.5,
+            "pit_exit_track_pos": 0.6,  # known offset from racing line at pit exit
         }
         cfg_path = Path(__file__).parent / "pit_exit_config.json"
         if cfg_path.exists():
@@ -185,7 +186,11 @@ class BotOrchestrator:
                 self._pit_exit_active = False
                 self._pit_exit_cfg = self._load_pit_exit_config()
                 self._pit_exit_turn_start = time.perf_counter()
-                logger.info("Pit exit: off pit road, starting merge sequence")
+                # Seed track position with known offset from racing line
+                pit_track_pos = self._pit_exit_cfg.get("pit_exit_track_pos", 0.6)
+                self.telemetry.set_forced_track_pos(pit_track_pos)
+                logger.info("Pit exit: off pit road, starting merge sequence "
+                            "(seeded track_pos=%.2f)", pit_track_pos)
 
             # Post-pit-exit: drive straight, then turn (config from pit_exit_config.json)
             if self._pit_exit_turn_start is not None:
@@ -280,12 +285,12 @@ class BotOrchestrator:
                         f"track_pos={state.track_pos:.2f}"
                     )
                     self._pit_exit_turn_start = None
-                    # Reset track position estimate to center so the model
-                    # doesn't inherit a stale offset from the pit exit path
-                    self.telemetry._track_pos_estimate = 0.0
                     # Reset safety controller so it doesn't carry edge/recovery
                     # state from the pit exit phase
                     self.safety.reset()
+                    # Note: track_pos is handled by the forced blend that was
+                    # seeded at pit exit — it will naturally converge to the
+                    # estimator's value over the next few seconds
             return None
 
         if not self._pit_exit_active:

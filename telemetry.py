@@ -104,6 +104,11 @@ class TelemetryReader:
         self._track_pos_estimate = 0.0
         self._track_map = None  # Optional TrackMap for better estimation
 
+        # Forced track position override (for pit exit seeding)
+        self._forced_track_pos = None    # float or None
+        self._forced_blend = 0.0         # 1.0 = fully forced, decays to 0.0
+        self._forced_decay_rate = 0.005  # per frame (~3s to halve at 60Hz)
+
     def connect(self) -> bool:
         """Attempt to connect to iRacing. Returns True if successful."""
         if not IRSDK_AVAILABLE:
@@ -235,6 +240,26 @@ class TelemetryReader:
         self._track_map = track_map
         logger.info("Track map attached for position estimation")
 
+    def set_forced_track_pos(self, track_pos: float, blend: float = 1.0,
+                              decay_rate: float = 0.005):
+        """Seed the track position with a known value.
+
+        Use this when you know exactly where the car is (e.g. pit exit).
+        The forced value blends with the estimated value and decays over time.
+
+        Args:
+            track_pos: Known lateral position (-1 to +1).
+            blend: Initial blend factor (1.0 = fully forced).
+            decay_rate: Per-frame decay (0.005 ≈ 3s to halve at 60Hz).
+        """
+        self._forced_track_pos = float(track_pos)
+        self._forced_blend = float(blend)
+        self._forced_decay_rate = float(decay_rate)
+        logger.info(
+            "Forced track_pos seeded: %.2f (blend=%.2f, decay=%.4f)",
+            track_pos, blend, decay_rate,
+        )
+
     def _estimate_track_pos(
         self, speed: float, steering: float, lat_g: float,
         yaw_rate: float, lap_dist_pct: float, dt: float = 1.0 / 60
@@ -258,7 +283,7 @@ class TelemetryReader:
 
         if self._track_map is not None:
             # Use track map for better estimation
-            track_pos = self._track_map.estimate_track_pos(
+            estimated_pos = self._track_map.estimate_track_pos(
                 lap_dist_pct, speed, steering, lat_g
             )
         else:
@@ -278,9 +303,21 @@ class TelemetryReader:
                 # Car nearly stopped - assume centered
                 self._track_pos_estimate *= 0.95
 
-            track_pos = np.clip(self._track_pos_estimate, -1.0, 1.0)
+            estimated_pos = np.clip(self._track_pos_estimate, -1.0, 1.0)
 
-        return float(track_pos)
+        # Blend with forced track position if active
+        if self._forced_blend > 0.01 and self._forced_track_pos is not None:
+            b = self._forced_blend
+            track_pos = b * self._forced_track_pos + (1.0 - b) * estimated_pos
+            # Decay the forced override — also move the forced value
+            # toward the estimate so it converges smoothly
+            self._forced_blend = max(0.0, self._forced_blend - self._forced_decay_rate)
+            self._forced_track_pos += (estimated_pos - self._forced_track_pos) * 0.01
+        else:
+            track_pos = estimated_pos
+            self._forced_blend = 0.0
+
+        return float(np.clip(track_pos, -1.0, 1.0))
 
     def _read_state(self) -> CarState:
         """Read current frame from iRacing shared memory."""

@@ -30,6 +30,7 @@ DEFAULTS = {
     "ramp_duration": 3.0,        # seconds to blend from turn to model handoff
     "cruise_until_lap_pct": 0.15, # keep autopilot until this lap %
     "cruise_throttle": 0.50,     # throttle during cruise phase
+    "pit_exit_track_pos": 0.60,  # known track offset at pit exit (+ = right of line)
 }
 
 
@@ -164,6 +165,17 @@ class PitExitGUI(QWidget):
         self.cruise_thr.setValue(cfg.get("cruise_throttle", 0.50))
         cg.addWidget(self.cruise_thr, 1, 1)
 
+        cg.addWidget(QLabel("Pit exit track offset:"), 2, 0)
+        self.pit_track_pos = QDoubleSpinBox()
+        self.pit_track_pos.setRange(-1.0, 1.0)
+        self.pit_track_pos.setSingleStep(0.05)
+        self.pit_track_pos.setDecimals(2)
+        self.pit_track_pos.setValue(cfg.get("pit_exit_track_pos", 0.60))
+        cg.addWidget(self.pit_track_pos, 2, 1)
+        pos_hint = QLabel("+ = right of racing line at pit exit")
+        pos_hint.setStyleSheet("color: gray; font-size: 10px;")
+        cg.addWidget(pos_hint, 2, 2)
+
         cruise_group.setLayout(cg)
         layout.addWidget(cruise_group)
 
@@ -197,6 +209,7 @@ class PitExitGUI(QWidget):
             "ramp_duration": self.ramp_dur.value(),
             "cruise_until_lap_pct": self.cruise_pct.value(),
             "cruise_throttle": self.cruise_thr.value(),
+            "pit_exit_track_pos": self.pit_track_pos.value(),
         }
         save_config(cfg)
         self.status.setText(f"Saved to {CONFIG_PATH.name}")
@@ -211,6 +224,7 @@ class PitExitGUI(QWidget):
         self.ramp_dur.setValue(DEFAULTS["ramp_duration"])
         self.cruise_pct.setValue(DEFAULTS["cruise_until_lap_pct"])
         self.cruise_thr.setValue(DEFAULTS["cruise_throttle"])
+        self.pit_track_pos.setValue(DEFAULTS["pit_exit_track_pos"])
         self.status.setText("Reset to defaults (not saved yet)")
         QTimer.singleShot(3000, lambda: self.status.setText(""))
 
