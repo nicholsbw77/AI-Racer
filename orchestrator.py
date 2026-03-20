@@ -132,6 +132,7 @@ class BotOrchestrator:
         # Pit exit autopilot state
         self._pit_exit_active = False
         self._pit_exit_logged = False
+        self._pit_exit_turn_start = None  # timestamp for post-pit-exit turn
 
         # Register Ctrl+C handler
         signal.signal(signal.SIGINT, self._shutdown_handler)
@@ -151,10 +152,28 @@ class BotOrchestrator:
             (throttle, brake, steering) or None if pit exit is complete
         """
         if not state.on_pit_road:
-            # We've exited the pits
+            # We've exited the pits — start the post-pit left turn at Sebring
             if self._pit_exit_active:
-                logger.info("Pit exit complete — handing off to model")
                 self._pit_exit_active = False
+                self._pit_exit_turn_start = time.perf_counter()
+                logger.info("Pit exit: off pit road, starting left turn merge")
+
+            # Post-pit-exit left turn: ~60 degrees for 1.5 seconds
+            if self._pit_exit_turn_start is not None:
+                elapsed = time.perf_counter() - self._pit_exit_turn_start
+                if elapsed < 1.5:
+                    steering = -0.33  # left turn (~60 deg)
+                    throttle = 0.35   # moderate throttle through the turn
+                    brake = 0.0
+                    if int(elapsed * 10) % 5 == 0:
+                        logger.info(
+                            f"PIT EXIT TURN: steer={steering:.2f} thr={throttle:.2f} "
+                            f"elapsed={elapsed:.1f}s speed={state.speed:.1f}m/s"
+                        )
+                    return throttle, brake, steering
+                else:
+                    logger.info("Pit exit turn complete — handing off to model")
+                    self._pit_exit_turn_start = None
             return None
 
         if not self._pit_exit_active:
