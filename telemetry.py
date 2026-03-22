@@ -2,7 +2,7 @@
 agent/telemetry.py
 
 Reads live telemetry from iRacing via pyirsdk shared memory.
-Runs at up to 360Hz synchronized to iRacing's physics tick.
+Runs at a configurable rate (default 60Hz) synchronized to iRacing's telemetry tick.
 
 Key iRacing SDK variables used:
   Speed           - m/s
@@ -61,12 +61,12 @@ class CarState:
 
 class TelemetryReader:
     """
-    Reads iRacing telemetry at up to 360Hz.
-    Uses wait_for_data() to sync exactly to iRacing's physics tick.
+    Reads iRacing telemetry at a configurable rate (default 60Hz).
+    Uses wait_for_data() to sync to iRacing's telemetry tick.
     Thread-safe via a lock on the latest state.
     """
 
-    def __init__(self, target_hz: int = 360):
+    def __init__(self, target_hz: int = 60):
         self.target_hz = target_hz
         self._ir = None
         self._connected = False

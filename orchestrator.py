@@ -4,7 +4,7 @@ orchestrator.py
 Main entry point for the live iRacing AI bot.
 
 Ties together:
-  - TelemetryReader (pyirsdk @ 360Hz)
+  - TelemetryReader (pyirsdk @ 60Hz)
   - DrivingAgent (model inference)
   - VJoyController (virtual controller output)
 
@@ -97,7 +97,7 @@ def _resolve_sequence_history(cfg: dict):
 class BotOrchestrator:
     """
     Main control loop: read telemetry → predict → send inputs.
-    Runs at target 360Hz synchronized to iRacing physics tick.
+    Runs at target 60Hz (configurable via config.yaml inference.loop_hz).
     """
 
     def __init__(self, cfg: dict, mock: bool = False):
@@ -110,7 +110,7 @@ class BotOrchestrator:
             target_hz=cfg["inference"]["loop_hz"]
         )
         # DrivingAgent forces CPU for inference — a small MLP doesn't benefit
-        # from GPU, and 360Hz CUDA allocations crash Studio drivers via TDR.
+        # from GPU, and per-frame CUDA allocations crash Studio drivers via TDR.
         self.agent = DrivingAgent(cfg)
 
         if mock:
