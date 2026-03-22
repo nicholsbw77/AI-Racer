@@ -32,7 +32,27 @@ from typing import Optional
 
 import numpy as np
 import yaml
-import torch
+
+try:
+    import torch
+except OSError as _torch_err:
+    if "torch_cuda" in str(_torch_err) or "torch_hip" in str(_torch_err):
+        # CUDA-enabled PyTorch installed but CUDA runtime not available.
+        # Clear partial torch imports and retry after disabling CUDA.
+        _stale = [k for k in sys.modules if k == "torch" or k.startswith("torch.")]
+        for _k in _stale:
+            del sys.modules[_k]
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+        try:
+            import torch
+        except OSError:
+            sys.exit(
+                "ERROR: PyTorch failed to load — CUDA libraries are missing.\n"
+                "Install CPU-only PyTorch to fix this:\n"
+                "  pip install torch --index-url https://download.pytorch.org/whl/cpu"
+            )
+    else:
+        raise
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent))

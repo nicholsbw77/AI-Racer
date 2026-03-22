@@ -18,7 +18,26 @@ import time
 from pathlib import Path
 
 import numpy as np
-import torch
+
+try:
+    import torch
+except OSError as _torch_err:
+    if "torch_cuda" in str(_torch_err) or "torch_hip" in str(_torch_err):
+        _stale = [k for k in sys.modules if k == "torch" or k.startswith("torch.")]
+        for _k in _stale:
+            del sys.modules[_k]
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+        try:
+            import torch
+        except OSError:
+            sys.exit(
+                "ERROR: PyTorch failed to load — CUDA libraries are missing.\n"
+                "Install CPU-only PyTorch to fix this:\n"
+                "  pip install torch --index-url https://download.pytorch.org/whl/cpu"
+            )
+    else:
+        raise
+
 import torch.nn as nn
 from torch.utils.data import DataLoader
 import yaml
