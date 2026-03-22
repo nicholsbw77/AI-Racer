@@ -106,13 +106,12 @@ class BotOrchestrator:
         self._running = False
 
         # Components
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        logger.info(f"Inference device: {device}")
-
         self.telemetry = TelemetryReader(
             target_hz=cfg["inference"]["loop_hz"]
         )
-        self.agent = DrivingAgent(cfg, device=device)
+        # DrivingAgent forces CPU for inference — a small MLP doesn't benefit
+        # from GPU, and 360Hz CUDA allocations crash Studio drivers via TDR.
+        self.agent = DrivingAgent(cfg)
 
         if mock:
             self.controller = MockController()

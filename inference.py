@@ -32,12 +32,17 @@ class DrivingAgent:
         self.cfg = cfg
         self.inf_cfg = cfg.get("inference", {})
 
-        if device is None:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.device = device
+        # Force CPU for inference — the model is a small MLP where GPU transfer
+        # overhead far exceeds compute savings.  Running on CUDA at 360Hz
+        # hammers the driver's memory allocator and can trigger TDR crashes,
+        # especially with Studio drivers.
+        self.device = torch.device("cpu")
 
         self.model: Optional[DrivingPolicyNet] = None
         self.current_combo: Optional[str] = None
+
+        # Pre-allocated input tensor buffer (resized on checkpoint load)
+        self._input_buf: Optional[torch.Tensor] = None
 
         # EMA state
         alpha = self.inf_cfg.get("ema_alpha", 0.20)
@@ -56,7 +61,7 @@ class DrivingAgent:
 
         self.min_speed_cutoff = self.inf_cfg.get("min_speed_cutoff", 2.0)
 
-        logger.info(f"DrivingAgent initialized on {device} (EMA α={alpha})")
+        logger.info(f"DrivingAgent initialized on CPU (EMA α={alpha})")
 
     def load_checkpoint(self, combo_name: str) -> bool:
         """
@@ -71,17 +76,23 @@ class DrivingAgent:
             return False
 
         try:
-            ckpt = torch.load(best_path, map_location=self.device)
+            ckpt = torch.load(best_path, map_location="cpu")
             model_cfg = ckpt["cfg"]["model"]
 
+            input_dim = ckpt["input_dim"]
             self.model = DrivingPolicyNet(
-                input_dim=ckpt["input_dim"],
+                input_dim=input_dim,
                 hidden_dims=tuple(model_cfg["hidden_dims"]),
                 dropout=0.0,  # Disable dropout at inference time
-            ).to(self.device)
+            )
+            # Model stays on CPU — no .to(device) needed
 
             self.model.load_state_dict(ckpt["model_state_dict"])
             self.model.eval()
+
+            # Pre-allocate a reusable input tensor to avoid creating a new
+            # tensor (and triggering memory allocation) every frame at 360Hz
+            self._input_buf = torch.empty(input_dim, dtype=torch.float32)
 
             self.current_combo = combo_name
             self._reset_ema()
@@ -120,9 +131,9 @@ class DrivingAgent:
             logger.warning("No model loaded - returning safe state")
             return 0.0, 0.0, 0.0
 
-        # Inference
-        x = torch.from_numpy(state_vector).to(self.device)
-        raw_throttle, raw_brake, raw_steering = self.model.predict(x)
+        # Inference — copy into pre-allocated buffer (zero-alloc hot path)
+        self._input_buf.copy_(torch.from_numpy(state_vector))
+        raw_throttle, raw_brake, raw_steering = self.model.predict(self._input_buf)
 
         # EMA smoothing
         throttle = self._ema(self.ema_throttle, raw_throttle)
