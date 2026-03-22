@@ -18,7 +18,15 @@ import time
 from pathlib import Path
 
 import numpy as np
-import torch
+
+try:
+    import torch
+except OSError:
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    import torch
+    logging.getLogger(__name__).warning(
+        "PyTorch CUDA libraries failed to load — falling back to CPU."
+    )
 import torch.nn as nn
 from torch.utils.data import DataLoader
 import yaml

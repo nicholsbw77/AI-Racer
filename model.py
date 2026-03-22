@@ -14,7 +14,13 @@ Architecture rationale:
     during single-sample inference at 360Hz
 """
 
-import torch
+import os
+
+try:
+    import torch
+except OSError:
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    import torch
 import torch.nn as nn
 from typing import Tuple, Optional
 

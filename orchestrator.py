@@ -32,7 +32,18 @@ from typing import Optional
 
 import numpy as np
 import yaml
-import torch
+
+try:
+    import torch
+except OSError:
+    # CUDA DLL loading can fail on Windows when the installed CUDA toolkit
+    # is incompatible with the PyTorch build.  Fall back to CPU-only.
+    import os as _os
+    _os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    import torch  # retry without CUDA
+    logging.getLogger(__name__).warning(
+        "PyTorch CUDA libraries failed to load — falling back to CPU."
+    )
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent))

@@ -11,8 +11,14 @@ The state vector is:
 This gives the model temporal context without needing an LSTM.
 """
 
+import os
 import numpy as np
-import torch
+
+try:
+    import torch
+except OSError:
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    import torch
 from torch.utils.data import Dataset
 from typing import Tuple
 
