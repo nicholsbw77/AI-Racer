@@ -108,7 +108,16 @@ def load_ibt_file(filepath: str) -> Optional[pd.DataFrame]:
         try:
             values = ibt.get_all(iracing_name)
             if values is not None:
-                data[canonical_name] = np.array(values, dtype=np.float32)
+                arr = np.array(values, dtype=np.float32)
+                # Some iRacing channels return arrays-per-tick (e.g. 2D)
+                # when high-rate sub-sampling is enabled (360Hz packed into
+                # 60Hz ticks gives shape (N, 6)).  Average across sub-samples
+                # to get a single scalar per tick.
+                if arr.ndim > 1:
+                    logger.debug(f"Averaging multi-dim channel {iracing_name} "
+                                 f"(shape {arr.shape}) from {path.name}")
+                    arr = arr.mean(axis=1)
+                data[canonical_name] = arr
         except Exception:
             logger.debug(f"Could not read channel {iracing_name} from {path.name}")
 
