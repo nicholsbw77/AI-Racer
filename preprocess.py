@@ -6,10 +6,15 @@ Run this once before training.
 
 Usage:
   python preprocess.py --input data/ --output data/processed/
+  python preprocess.py --input data/ --output data/processed/ --build-map
 
 Scans the input folder for .ibt files, groups them by car+track combo
 (parsed from the iRacing filename convention), normalizes and engineers
 features, then writes one data.parquet + meta.yaml per combo.
+
+Enhanced with:
+  - Automatic TrackMap building during preprocessing
+  - Track map saved alongside processed data for live inference
 
 iRacing .ibt filename convention:
   {car}_{track} {YYYY-MM-DD HH-MM-SS} ({utc_timestamp}).ibt
@@ -20,6 +25,7 @@ Outputs:
     {car}_{track}/
       data.parquet   (cleaned, normalized, feature-engineered)
       meta.yaml      (dataset stats)
+      track_map.yaml (segment profiles for GPS-free positioning)
 """
 
 import sys
@@ -40,6 +46,7 @@ from loader import (
     ACTION_FEATURES,
 )
 from ibt_loader import load_ibt_file, parse_combo_from_filename
+from track_map import TrackMap
 
 logging.basicConfig(
     level=logging.INFO,
@@ -71,7 +78,7 @@ def _resolve_sequence_history(cfg: dict):
 def group_ibt_files(input_root: Path) -> dict:
     """
     Scan input_root for .ibt files and group them by {car}_{track} combo.
-    Returns dict: combo_name → list of Path objects.
+    Returns dict: combo_name -> list of Path objects.
     """
     ibt_files = sorted(input_root.glob("**/*.ibt"))
     if not ibt_files:
@@ -93,6 +100,7 @@ def preprocess_combo(
     ibt_files: list,
     output_dir: Path,
     cfg: dict,
+    build_map: bool = True,
 ) -> dict:
     """
     Process all .ibt files for one track/car combo.
@@ -138,6 +146,25 @@ def preprocess_combo(
         logger.warning(f"No clean laps in {combo_name}")
         return {}
 
+    # Build track map BEFORE speed normalization (needs raw speeds)
+    track_map_path = None
+    if build_map:
+        track_cfg = cfg.get("track", {})
+        num_segments = track_cfg.get("num_segments", 100)
+        track_map = TrackMap(num_segments=num_segments)
+        track_map.build_from_dataframe(combined, combo_name)
+        if personal_best:
+            track_map.personal_best_s = personal_best
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        track_map_path = str(output_dir / "track_map.yaml")
+        track_map.save(track_map_path)
+
+        # Also save to checkpoints dir for live inference
+        ckpt_map_dir = Path(cfg["paths"]["checkpoints"]) / combo_name
+        ckpt_map_dir.mkdir(parents=True, exist_ok=True)
+        track_map.save(str(ckpt_map_dir / "track_map.yaml"))
+
     # Normalize speed globally for this combo
     speed_max = float(combined["speed"].max())
     if speed_max > 0:
@@ -163,19 +190,22 @@ def preprocess_combo(
         "sequence_history": cfg["training"]["sequence_history"],
         "features": STATE_FEATURES,
         "actions": ACTION_FEATURES,
+        "track_map": track_map_path,
     }
 
     with open(output_dir / "meta.yaml", "w") as f:
         yaml.dump(meta, f, default_flow_style=False)
 
     logger.info(
-        f"  ✓ {clean_laps}/{total_laps} clean laps, "
-        f"{len(combined):,} frames → {output_path}"
+        f"  -> {clean_laps}/{total_laps} clean laps, "
+        f"{len(combined):,} frames -> {output_path}"
     )
     if personal_best:
         mins = int(personal_best // 60)
         secs = personal_best % 60
         logger.info(f"  Personal best: {mins}:{secs:06.3f}")
+    if track_map_path:
+        logger.info(f"  Track map: {track_map_path}")
 
     return meta
 
@@ -189,6 +219,8 @@ def main():
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--combo", default=None,
                         help="Only process this combo name (e.g. cadillacctsvr_lagunaseca)")
+    parser.add_argument("--no-map", action="store_true",
+                        help="Skip building track maps")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -217,10 +249,12 @@ def main():
             logger.error(f"No combo matching '{args.combo}' found")
             sys.exit(1)
 
+    build_map = cfg.get("track", {}).get("auto_build_map", True) and not args.no_map
+
     all_meta = {}
     for combo_name, ibt_files in sorted(groups.items()):
         out_dir = output_root / combo_name
-        meta = preprocess_combo(combo_name, ibt_files, out_dir, cfg)
+        meta = preprocess_combo(combo_name, ibt_files, out_dir, cfg, build_map=build_map)
         if meta:
             all_meta[combo_name] = meta
 
@@ -232,6 +266,7 @@ def main():
     logger.info(f"Combos processed  : {len(all_meta)}")
     logger.info(f"Total clean laps  : {total_laps:,}")
     logger.info(f"Total frames      : {total_frames:,}")
+    logger.info(f"Track maps built  : {sum(1 for m in all_meta.values() if m.get('track_map'))}")
     logger.info(f"Output            : {output_root}")
 
 

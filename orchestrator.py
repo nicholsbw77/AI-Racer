@@ -5,7 +5,9 @@ Main entry point for the live iRacing AI bot.
 
 Ties together:
   - TelemetryReader (pyirsdk @ 360Hz)
-  - DrivingAgent (model inference)
+  - DrivingAgent (model inference + track-aware features)
+  - SafetyController (multi-layer safety system)
+  - TrackMap / LiveTracker (GPS-free track positioning)
   - VJoyController (virtual controller output)
 
 Usage:
@@ -14,10 +16,12 @@ Usage:
   python orchestrator.py --mock           # dry run without iRacing/vJoy (for testing)
 
 Safety features:
-  - Ctrl+C to stop at any time → releases all inputs instantly
+  - Ctrl+C to stop at any time -> releases all inputs instantly
+  - 10-layer safety controller (see safety.py)
   - Automatic input release if iRacing disconnects
-  - Speed cutoff: no inputs sent below min_speed_cutoff
-  - Watchdog: kills bot if lap time exceeds 2× personal best (car stuck/crashed)
+  - Track boundary monitoring via TrackMap
+  - Spin/collision detection and recovery
+  - Lap time watchdog: kills bot if lap too slow
 """
 
 import sys
@@ -40,6 +44,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 from telemetry import TelemetryReader, CarState
 from inference import DrivingAgent
 from controller import VJoyController, MockController
+from safety import SafetyController, SafetyAction, SafetyVerdict
+from track_map import TrackMap, LiveTracker
 
 
 def setup_logging() -> Path:
@@ -96,7 +102,7 @@ def _resolve_sequence_history(cfg: dict):
 
 class BotOrchestrator:
     """
-    Main control loop: read telemetry → predict → send inputs.
+    Main control loop: read telemetry -> predict -> safety check -> send inputs.
     Runs at target 360Hz synchronized to iRacing physics tick.
     """
 
@@ -113,11 +119,15 @@ class BotOrchestrator:
             target_hz=cfg["inference"]["loop_hz"]
         )
         self.agent = DrivingAgent(cfg, device=device)
+        self.safety = SafetyController(cfg)
 
         if mock:
             self.controller = MockController()
         else:
             self.controller = VJoyController(device_id=1)
+
+        # Track positioning
+        self.tracker: Optional[LiveTracker] = None
 
         # Metrics
         self._lap_count = 0
@@ -129,6 +139,10 @@ class BotOrchestrator:
         # Pit exit autopilot state
         self._pit_exit_active = False
         self._pit_exit_logged = False
+
+        # Safety stats
+        self._safety_kills = 0
+        self._safety_interventions = 0
 
         # Register Ctrl+C handler
         signal.signal(signal.SIGINT, self._shutdown_handler)
@@ -150,7 +164,7 @@ class BotOrchestrator:
         if not state.on_pit_road:
             # We've exited the pits
             if self._pit_exit_active:
-                logger.info("Pit exit complete — handing off to model")
+                logger.info("Pit exit complete -- handing off to model")
                 self._pit_exit_active = False
             return None
 
@@ -158,16 +172,15 @@ class BotOrchestrator:
             self._pit_exit_active = True
             logger.info("Pit exit autopilot engaged")
 
-        # Pit speed limit is typically 60-80 km/h (16-22 m/s)
-        PIT_SPEED_LIMIT = 18.0  # m/s (~65 km/h), safe for most tracks
+        # Use safety controller's pit speed limit
+        pit_limit = self.safety.config.pit_speed_limit_ms
 
         # Gentle throttle to get moving, back off near speed limit
         if state.speed < 2.0:
-            # Starting from standstill — need more throttle to get rolling
             throttle = 0.5
-        elif state.speed < PIT_SPEED_LIMIT * 0.8:
+        elif state.speed < pit_limit * 0.8:
             throttle = 0.4
-        elif state.speed < PIT_SPEED_LIMIT:
+        elif state.speed < pit_limit:
             throttle = 0.15  # coast near limit
         else:
             throttle = 0.0   # over limit, lift
@@ -175,8 +188,6 @@ class BotOrchestrator:
         brake = 0.0
 
         # Minimal steering correction using lateral G
-        # If car drifts left (negative lat_g), steer slightly right
-        # Gain is very small — pit lanes are straight, we just nudge
         steer_correction = -state.lat_g * 0.005
         steering = max(-0.15, min(0.15, steer_correction))
 
@@ -198,13 +209,7 @@ class BotOrchestrator:
         return throttle, brake, steering
 
     def _match_checkpoint(self, raw_combo: str) -> str:
-        """Match auto-detected combo to an existing checkpoint folder.
-
-        iRacing returns full display names like
-        'sebring_international_raceway_cadillac_cts_v_racecar' but checkpoints
-        use abbreviated .ibt-derived names like 'cadillacctsvr_sebring_international'.
-        We score each checkpoint folder by how many of the detected keywords it contains.
-        """
+        """Match auto-detected combo to an existing checkpoint folder."""
         ckpt_dir = Path("checkpoints")
         if not ckpt_dir.exists():
             return raw_combo
@@ -214,16 +219,13 @@ class BotOrchestrator:
         if not candidates:
             return raw_combo
 
-        # Tokenize the detected combo into keywords
         keywords = set(raw_combo.split("_"))
-        # Remove very short / common noise words
         keywords = {k for k in keywords if len(k) > 2}
 
         best_match = raw_combo
         best_score = 0
 
         for cand in candidates:
-            # Score: how many keywords appear as substrings in the candidate
             score = sum(1 for kw in keywords if kw in cand)
             if score > best_score:
                 best_score = score
@@ -243,7 +245,6 @@ class BotOrchestrator:
         if not self.mock:
             if not self.telemetry.connect():
                 logger.warning("iRacing not detected. Waiting...")
-                # Retry loop — wait for iRacing to start
                 while not self.telemetry.connect():
                     logger.info("Retrying iRacing connection in 5s...")
                     time.sleep(5)
@@ -271,14 +272,28 @@ class BotOrchestrator:
             else:
                 logger.warning("Mock mode: running without model (random outputs)")
 
+        # Load track map if available
+        self.agent.load_track_map(combo_name)
+        if self.agent.has_track_map:
+            self.tracker = LiveTracker(
+                self.agent.track_map,
+                lookahead=self.cfg.get("track", {}).get("lookahead_segments", 5),
+            )
+            # Set personal best for lap watchdog
+            if self.agent.track_map.personal_best_s > 0:
+                self.safety.set_personal_best(self.agent.track_map.personal_best_s)
+
         # Start telemetry background thread
         self.telemetry.start()
 
         logger.info("Bot active. Press Ctrl+C to stop.")
         logger.info(f"Target loop rate: {self.cfg['inference']['loop_hz']}Hz")
+        logger.info(f"Safety controller: ACTIVE (10 layers)")
+        logger.info(f"Track map: {'LOADED' if self.agent.has_track_map else 'NOT AVAILABLE'}")
 
         self._running = True
         self._session_start = time.perf_counter()
+        self.safety.reset()
         self._run_loop(combo_name)
 
     def _run_loop(self, combo_name: str):
@@ -307,6 +322,13 @@ class BotOrchestrator:
                 if new_combo != combo_name:
                     logger.info(f"Auto-switching model to {new_combo}")
                     self.agent.load_checkpoint(new_combo)
+                    self.agent.load_track_map(new_combo)
+                    if self.agent.has_track_map:
+                        self.tracker = LiveTracker(
+                            self.agent.track_map,
+                            lookahead=self.cfg.get("track", {}).get("lookahead_segments", 5),
+                        )
+                    self.safety.reset()
                     combo_name = new_combo
 
             # Debug: log state flags periodically
@@ -317,63 +339,114 @@ class BotOrchestrator:
                     f"session_active={state.session_active} "
                     f"speed={state.speed:.1f}m/s "
                     f"gear={state.gear:.0f} "
-                    f"lap_pct={state.lap_dist_pct:.3f}"
+                    f"lap_pct={state.lap_dist_pct:.3f} "
+                    f"yaw={state.yaw_rate:.2f}rad/s"
                 )
 
-            # Skip if session not active
-            if not state.session_active:
-                self.controller.release()
-                time.sleep(0.01)
-                self._frame_count += 1
-                continue
-
             # --- Pit exit autopilot ---
-            # If on pit road, use simple autopilot to drive out
-            pit_result = self._pit_exit_autopilot(state)
-            if pit_result is not None:
-                throttle, brake, steering = pit_result
-                self.controller.set_inputs(throttle, brake, steering)
-                self.telemetry.inject_bot_actions(throttle, brake, steering)
+            if state.on_pit_road and state.session_active:
+                pit_result = self._pit_exit_autopilot(state)
+                if pit_result is not None:
+                    throttle, brake, steering = pit_result
+
+                    # Still run safety on pit autopilot outputs
+                    verdict = self.safety.check(
+                        state, throttle, brake, steering,
+                        is_on_track=state.is_on_track,
+                        on_pit_road=True,
+                        session_active=state.session_active,
+                    )
+                    self._apply_verdict(verdict, state)
+                    self._frame_count += 1
+                    self._sleep_remaining(loop_start, target_period)
+                    continue
+
+            # --- Safety pre-check: session/track gates ---
+            if not state.session_active or (not state.is_on_track and not state.on_pit_road):
+                verdict = self.safety.check(
+                    state, 0.0, 0.0, 0.0,
+                    is_on_track=state.is_on_track,
+                    on_pit_road=state.on_pit_road,
+                    session_active=state.session_active,
+                )
+                self._apply_verdict(verdict, state)
                 self._frame_count += 1
-
-                loop_elapsed = time.perf_counter() - loop_start
-                remaining = target_period - loop_elapsed
-                if remaining > 0.0001:
-                    time.sleep(remaining)
-                continue
-
-            # Skip if not on track (off-track excursion, not pits)
-            if not state.is_on_track:
-                self.controller.release()
                 time.sleep(0.01)
-                self._frame_count += 1
                 continue
+
+            # --- Track positioning update ---
+            track_features = None
+            boundary_pct = 0.0
+            if self.tracker:
+                track_ctx = self.tracker.update(
+                    state.lap_dist_pct,
+                    state.speed,
+                    state.steering,
+                    state.track_pos,
+                )
+                track_features = track_ctx["track_features"]
+                boundary_pct = track_ctx["boundary_pct"]
+
+                if track_ctx["lap_crossed"]:
+                    self.safety.reset_lap()
+                    self._lap_count += 1
+                    elapsed = time.perf_counter() - self._session_start
+                    logger.info(
+                        f"Lap {self._lap_count} complete  "
+                        f"(session time: {elapsed/60:.1f}min, "
+                        f"total frames: {self._frame_count:,})"
+                    )
+            else:
+                # Fallback lap detection without tracker
+                self._detect_lap_crossing(state)
+                # Try to get track features from agent
+                track_features = self.agent.get_track_features(
+                    state.lap_dist_pct, state.speed
+                )
+                boundary_pct = self.agent.get_boundary_proximity(
+                    state.lap_dist_pct, state.track_pos
+                )
 
             # --- Model-driven control ---
-            # Build state vector for inference
             state_vec = self.telemetry.build_state_vector(
                 state,
                 sequence_history=sequence_history,
+                track_features=track_features,
             )
 
             # Run inference
             throttle, brake, steering = self.agent.predict(
                 state_vec,
                 car_speed_ms=state.speed,
+                lap_dist_pct=state.lap_dist_pct,
             )
+
+            # --- Safety controller ---
+            verdict = self.safety.check(
+                state, throttle, brake, steering,
+                track_boundary_pct=boundary_pct,
+                is_on_track=state.is_on_track,
+                on_pit_road=state.on_pit_road,
+                session_active=state.session_active,
+            )
+
+            self._apply_verdict(verdict, state)
 
             # Debug: log model outputs periodically
             if self._frame_count % 60 == 0:
+                safety_tag = ""
+                if verdict.action != SafetyAction.PASS:
+                    safety_tag = f" [SAFETY:{verdict.layer}]"
                 logger.info(
-                    f"Output: thr={throttle:.3f} brk={brake:.3f} "
-                    f"steer={steering:.3f} speed={state.speed:.1f}"
+                    f"Output: thr={verdict.throttle:.3f} brk={verdict.brake:.3f} "
+                    f"steer={verdict.steering:.3f} speed={state.speed:.1f}"
+                    f"{safety_tag}"
                 )
 
-            # Send to controller
-            self.controller.set_inputs(throttle, brake, steering)
-
             # Inject bot outputs into history buffer for next prediction
-            self.telemetry.inject_bot_actions(throttle, brake, steering)
+            self.telemetry.inject_bot_actions(
+                verdict.throttle, verdict.brake, verdict.steering
+            )
 
             # Handle gear shifts
             target_gear = int(round(state.gear))
@@ -382,24 +455,46 @@ class BotOrchestrator:
 
             # Metrics
             self._frame_count += 1
-            self._detect_lap_crossing(state)
 
             loop_elapsed = time.perf_counter() - loop_start
             self._loop_times.append(loop_elapsed)
 
-            # Log performance every 360 frames (approx ~6 seconds at 60Hz)
+            # Log performance every 360 frames
             if self._frame_count % 360 == 0:
                 self._log_stats()
 
-            # Yield remaining time in period (prevents CPU hammering)
-            remaining = target_period - loop_elapsed
-            if remaining > 0.0001:
-                time.sleep(remaining)
+            # Yield remaining time in period
+            self._sleep_remaining(loop_start, target_period)
+
+    def _apply_verdict(self, verdict: SafetyVerdict, state: CarState):
+        """Apply a safety verdict to the controller."""
+        if verdict.action == SafetyAction.KILL:
+            self.controller.release()
+            self._safety_kills += 1
+            if self._safety_kills % 10 == 1:
+                logger.warning(f"Safety KILL: {verdict.reason}")
+        elif verdict.action == SafetyAction.OVERRIDE:
+            self.controller.set_inputs(verdict.throttle, verdict.brake, verdict.steering)
+            self._safety_interventions += 1
+        elif verdict.action == SafetyAction.ATTENUATE:
+            self.controller.set_inputs(verdict.throttle, verdict.brake, verdict.steering)
+            self._safety_interventions += 1
+        else:
+            # PASS — send through
+            self.controller.set_inputs(verdict.throttle, verdict.brake, verdict.steering)
+
+    def _sleep_remaining(self, loop_start: float, target_period: float):
+        """Sleep for remaining time in the loop period."""
+        elapsed = time.perf_counter() - loop_start
+        remaining = target_period - elapsed
+        if remaining > 0.0001:
+            time.sleep(remaining)
 
     def _detect_lap_crossing(self, state: CarState):
         """Detect lap completion by watching lap_dist_pct wrap around."""
         if self._last_lap_dist > 0.95 and state.lap_dist_pct < 0.05:
             self._lap_count += 1
+            self.safety.reset_lap()
             elapsed = time.perf_counter() - self._session_start
             logger.info(
                 f"Lap {self._lap_count} complete  "
@@ -416,11 +511,14 @@ class BotOrchestrator:
         avg_ms = np.mean(recent) * 1000
         max_ms = np.max(recent) * 1000
         actual_hz = 1.0 / np.mean(recent) if np.mean(recent) > 0 else 0
-        self._loop_times = self._loop_times[-360:]  # keep last 1s
+        self._loop_times = self._loop_times[-360:]
 
+        safety_summary = self.safety.get_summary()
         logger.info(
             f"Loop: {actual_hz:.0f}Hz  avg={avg_ms:.2f}ms  "
-            f"max={max_ms:.2f}ms  laps={self._lap_count}"
+            f"max={max_ms:.2f}ms  laps={self._lap_count}  "
+            f"safety_kills={safety_summary['total_kills']}  "
+            f"incidents={safety_summary['incident_count']}"
         )
 
     def _shutdown_handler(self, signum, frame):
@@ -430,7 +528,7 @@ class BotOrchestrator:
         self.shutdown()
 
     def shutdown(self):
-        """Clean shutdown: release inputs, stop threads."""
+        """Clean shutdown: release inputs, stop threads, log summary."""
         logger.info("Releasing controller inputs...")
         self.controller.release()
         self.controller.disconnect()
@@ -438,11 +536,14 @@ class BotOrchestrator:
         logger.info("Stopping telemetry reader...")
         self.telemetry.stop()
 
+        # Log safety summary
+        self.safety.log_summary()
+
         elapsed = time.perf_counter() - self._session_start
         logger.info(
             f"Session summary: {self._lap_count} laps, "
             f"{self._frame_count:,} frames in {elapsed:.1f}s "
-            f"(avg {self._frame_count/elapsed:.0f}Hz)"
+            f"(avg {self._frame_count/max(elapsed,0.001):.0f}Hz)"
         )
 
 
@@ -469,7 +570,6 @@ def main():
     elif args.track and args.car:
         combo_name = f"{args.track}_{args.car}"
     elif args.auto or args.mock:
-        # Will auto-detect from session info after connecting
         combo_name = None
     else:
         parser.print_help()

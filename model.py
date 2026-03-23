@@ -12,6 +12,11 @@ Architecture rationale:
     activation functions and loss weightings
   - LayerNorm (not BatchNorm): works correctly with batch_size=1
     during single-sample inference at 360Hz
+
+Enhanced with:
+  - Track-aware input handling (variable input_dim supports track features)
+  - Wider steering head for better cornering precision
+  - Gradient-friendly initialization
 """
 
 import torch
@@ -52,7 +57,7 @@ class DrivingPolicyNet(nn.Module):
     """
     Main behavior cloning network.
 
-    Input:  state vector (current features + flattened action history)
+    Input:  state vector (current features + flattened action history + optional track features)
     Output: (throttle, brake, steering) tuple
 
     Output ranges:
@@ -87,6 +92,7 @@ class DrivingPolicyNet(nn.Module):
         final_dim = hidden_dims[-1]
 
         # Separate heads for each output - allows independent tuning
+        # Throttle head: straightforward 0-1 output
         self.throttle_head = nn.Sequential(
             nn.Linear(final_dim, 32),
             nn.GELU(),
@@ -94,6 +100,7 @@ class DrivingPolicyNet(nn.Module):
             nn.Sigmoid(),
         )
 
+        # Brake head: needs to be crisp for braking zones
         self.brake_head = nn.Sequential(
             nn.Linear(final_dim, 32),
             nn.GELU(),
@@ -101,10 +108,14 @@ class DrivingPolicyNet(nn.Module):
             nn.Sigmoid(),
         )
 
+        # Steering head: wider for better cornering precision
+        # Steering is the most critical output for lap completion
         self.steering_head = nn.Sequential(
             nn.Linear(final_dim, 64),
             nn.GELU(),
-            nn.Linear(64, 1),
+            nn.Linear(64, 32),
+            nn.GELU(),
+            nn.Linear(32, 1),
             nn.Tanh(),
         )
 
