@@ -4,7 +4,7 @@ orchestrator.py
 Main entry point for the live iRacing AI bot.
 
 Ties together:
-  - TelemetryReader (pyirsdk @ 360Hz)
+  - TelemetryReader (pyirsdk @ 60Hz)
   - DrivingAgent (model inference)
   - VJoyController (virtual controller output)
 
@@ -30,6 +30,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+import json
 import numpy as np
 import yaml
 import torch
@@ -40,6 +41,9 @@ sys.path.insert(0, str(Path(__file__).parent))
 from telemetry import TelemetryReader, CarState
 from inference import DrivingAgent
 from controller import VJoyController, MockController
+from safety_controller import SafetyController
+from track_map import TrackMap
+from manual_override import ManualOverride
 
 
 def setup_logging() -> Path:
@@ -97,7 +101,7 @@ def _resolve_sequence_history(cfg: dict):
 class BotOrchestrator:
     """
     Main control loop: read telemetry → predict → send inputs.
-    Runs at target 360Hz synchronized to iRacing physics tick.
+    Runs at target 60Hz (configurable via config.yaml inference.loop_hz).
     """
 
     def __init__(self, cfg: dict, mock: bool = False):
@@ -106,18 +110,21 @@ class BotOrchestrator:
         self._running = False
 
         # Components
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        logger.info(f"Inference device: {device}")
-
         self.telemetry = TelemetryReader(
             target_hz=cfg["inference"]["loop_hz"]
         )
-        self.agent = DrivingAgent(cfg, device=device)
+        # DrivingAgent forces CPU for inference — a small MLP doesn't benefit
+        # from GPU, and per-frame CUDA allocations crash Studio drivers via TDR.
+        self.agent = DrivingAgent(cfg)
+        self.safety = SafetyController(cfg.get("safety", {}))
 
         if mock:
             self.controller = MockController()
         else:
             self.controller = VJoyController(device_id=1)
+
+        # Manual keyboard override (F1-F5)
+        self.manual = ManualOverride()
 
         # Metrics
         self._lap_count = 0
@@ -129,10 +136,45 @@ class BotOrchestrator:
         # Pit exit autopilot state
         self._pit_exit_active = False
         self._pit_exit_logged = False
+        self._pit_exit_turn_start = None  # timestamp for post-pit-exit turn
+        self._pit_stall_pullout_start = None  # timestamp for stall pullout maneuver
+        self._pit_stall_pullout_done = False   # True once pullout swerve is finished
+        self._pit_exit_cfg = self._load_pit_exit_config()
 
         # Register Ctrl+C handler
         signal.signal(signal.SIGINT, self._shutdown_handler)
         signal.signal(signal.SIGTERM, self._shutdown_handler)
+
+    @staticmethod
+    def _load_pit_exit_config() -> dict:
+        """Load pit exit config from GUI-generated JSON, with defaults."""
+        defaults = {
+            "straight_duration": 8.0,
+            "turn_angle": -60.0,
+            "turn_duration": 1.5,
+            "turn_throttle": 0.35,
+            "straight_throttle": 0.40,
+            "ramp_duration": 3.0,
+            "cruise_until_lap_pct": 0.20,
+            "cruise_throttle": 0.5,
+            "pit_exit_track_pos": 0.6,  # known offset from racing line at pit exit
+            "stall_pullout_left_dur": 1.2,    # seconds turning left out of stall
+            "stall_pullout_right_dur": 0.8,   # seconds turning right to straighten
+            "stall_pullout_steer": 0.35,      # steering magnitude for pullout
+            "stall_pullout_throttle": 0.35,   # gentle throttle during pullout
+        }
+        cfg_path = Path(__file__).parent / "pit_exit_config.json"
+        if cfg_path.exists():
+            try:
+                with open(cfg_path) as f:
+                    saved = json.load(f)
+                merged = {**defaults, **saved}
+                logger.info(f"Loaded pit exit config: {merged}")
+                return merged
+            except (json.JSONDecodeError, IOError):
+                pass
+        logger.info(f"Using default pit exit config: {defaults}")
+        return defaults
 
     def _pit_exit_autopilot(self, state) -> tuple:
         """
@@ -147,23 +189,243 @@ class BotOrchestrator:
         Returns:
             (throttle, brake, steering) or None if pit exit is complete
         """
+        # --- Stall pullout continues even after on_pit_road goes False ---
+        # At short-pit tracks (e.g. Summit), the car can cross the pit exit
+        # boundary mid-pullout.  Let the pullout finish before starting the
+        # post-pit merge sequence.
+        if (self._pit_exit_active and not self._pit_stall_pullout_done
+                and not state.on_pit_road):
+            # Still in stall pullout but already off pit road — keep running it
+            pcfg = self._pit_exit_cfg
+            left_dur = pcfg.get("stall_pullout_left_dur", 1.2)
+            right_dur = pcfg.get("stall_pullout_right_dur", 0.8)
+            pullout_steer = pcfg.get("stall_pullout_steer", 0.35)
+            pullout_thr = pcfg.get("stall_pullout_throttle", 0.35)
+
+            # Gear management while off pit road during pullout
+            if state.speed < 5.0:
+                target_gear = 1
+            else:
+                target_gear = 2
+            if target_gear != self.controller._current_gear:
+                self.controller.shift_to(target_gear)
+
+            if self._pit_stall_pullout_start is not None:
+                elapsed = time.perf_counter() - self._pit_stall_pullout_start
+                if elapsed < left_dur:
+                    steering = -pullout_steer
+                    throttle = pullout_thr
+                    brake = 0.0
+                    if self._frame_count % 30 == 0:
+                        logger.info(
+                            f"PIT STALL LEFT (off-road): steer={steering:.3f} "
+                            f"thr={throttle:.2f} elapsed={elapsed:.1f}/{left_dur:.1f}s "
+                            f"speed={state.speed:.1f}m/s"
+                        )
+                    return throttle, brake, steering
+                elif elapsed < left_dur + right_dur:
+                    steering = pullout_steer
+                    throttle = pullout_thr
+                    brake = 0.0
+                    if self._frame_count % 30 == 0:
+                        logger.info(
+                            f"PIT STALL RIGHT (off-road): steer={steering:.3f} "
+                            f"thr={throttle:.2f} elapsed={elapsed - left_dur:.1f}/{right_dur:.1f}s "
+                            f"speed={state.speed:.1f}m/s"
+                        )
+                    return throttle, brake, steering
+                else:
+                    self._pit_stall_pullout_done = True
+                    logger.info("Pit stall pullout complete (finished off pit road)")
+                    # Fall through to start the post-pit merge below
+            else:
+                # Not rolling yet — apply throttle to get moving
+                return 0.5, 0.0, 0.0
+
         if not state.on_pit_road:
-            # We've exited the pits
+            # We've exited the pits — start the post-pit merge sequence
             if self._pit_exit_active:
-                logger.info("Pit exit complete — handing off to model")
                 self._pit_exit_active = False
+                self._pit_exit_cfg = self._load_pit_exit_config()
+                self._pit_exit_turn_start = time.perf_counter()
+                # Seed track position with known offset from racing line
+                pit_track_pos = self._pit_exit_cfg.get("pit_exit_track_pos", 0.6)
+                self.telemetry.set_forced_track_pos(pit_track_pos)
+                logger.info("Pit exit: off pit road, starting merge sequence "
+                            "(seeded track_pos=%.2f)", pit_track_pos)
+
+            # Post-pit-exit: drive straight, then turn (config from pit_exit_config.json)
+            if self._pit_exit_turn_start is not None:
+                pcfg = self._pit_exit_cfg
+                straight_dur = pcfg["straight_duration"]
+                turn_dur = pcfg["turn_duration"]
+                # Convert angle in degrees to steering ratio (-1 to 1)
+                # Assume ~180 deg max lock, so divide by 180
+                turn_steering = max(-1.0, min(1.0, pcfg["turn_angle"] / 180.0))
+
+                elapsed = time.perf_counter() - self._pit_exit_turn_start
+                if elapsed < straight_dur:
+                    steer_correction = -state.lat_g * 0.005
+                    steering = max(-0.15, min(0.15, steer_correction))
+                    throttle = pcfg["straight_throttle"]
+                    brake = 0.0
+                    if int(elapsed * 10) % 50 == 0:
+                        logger.info(
+                            f"PIT EXIT STRAIGHT: steer={steering:.3f} thr={throttle:.2f} "
+                            f"elapsed={elapsed:.1f}/{straight_dur:.1f}s speed={state.speed:.1f}m/s"
+                        )
+                    return throttle, brake, steering
+                elif elapsed < straight_dur + turn_dur:
+                    steering = turn_steering
+                    throttle = pcfg["turn_throttle"]
+                    brake = 0.0
+                    if int(elapsed * 10) % 5 == 0:
+                        logger.info(
+                            f"PIT EXIT TURN: steer={steering:.2f} thr={throttle:.2f} "
+                            f"elapsed={elapsed - straight_dur:.1f}/{turn_dur:.1f}s speed={state.speed:.1f}m/s"
+                        )
+                    return throttle, brake, steering
+                elif elapsed < straight_dur + turn_dur + pcfg.get("ramp_duration", 3.0):
+                    # Ramp-up phase: moderate straight driving to build speed
+                    # and let telemetry history stabilize before model handoff
+                    ramp_dur = pcfg.get("ramp_duration", 3.0)
+                    ramp_elapsed = elapsed - straight_dur - turn_dur
+                    t = ramp_elapsed / ramp_dur
+                    throttle = pcfg["turn_throttle"] + t * (0.5 - pcfg["turn_throttle"])
+                    # Ease steering back to center
+                    steering_correction = -state.lat_g * 0.005
+                    steering = turn_steering * (1.0 - t) + steering_correction * t
+                    steering = max(-0.5, min(0.5, steering))
+                    brake = 0.0
+                    if int(elapsed * 10) % 10 == 0:
+                        logger.info(
+                            f"PIT EXIT RAMP: steer={steering:.3f} thr={throttle:.2f} "
+                            f"blend={t:.1%} elapsed={ramp_elapsed:.1f}/{ramp_dur:.1f}s speed={state.speed:.1f}m/s"
+                        )
+                    return throttle, brake, steering
+                else:
+                    # Cruise phase: steer toward the racing line (track_pos → 0)
+                    # and maintain moderate speed until model handoff.
+                    #
+                    # We do NOT trust the track map's typical_steering here —
+                    # the pit exit zone bins are often contaminated by pit road
+                    # data. Instead, use a simple proportional controller:
+                    # steer left when right of line, steer right when left.
+                    cruise_target = pcfg.get("cruise_until_lap_pct", 0.15)
+                    cruise_thr = pcfg.get("cruise_throttle", 0.5)
+                    # Handle wrap-around: pit exit near end of lap (e.g. 0.95)
+                    # with cruise target past start/finish (e.g. 0.02).
+                    # If target < 0.5, car might still be in the 0.9+ range
+                    # and needs to cross the S/F line first.
+                    if cruise_target < 0.5 and state.lap_dist_pct > 0.5:
+                        still_cruising = True  # haven't crossed S/F yet
+                    else:
+                        still_cruising = state.lap_dist_pct < cruise_target
+                    if still_cruising:
+                        # Drive straight — car is already on correct heading
+                        steering = 0.0
+
+                        throttle = cruise_thr
+                        brake = 0.0
+
+                        if self._frame_count % 60 == 0:
+                            logger.info(
+                                f"PIT EXIT CRUISE: steer={steering:.3f} thr={throttle:.2f} "
+                                f"speed={state.speed:.1f}m/s lap_pct={state.lap_dist_pct:.3f} "
+                                f"track_pos={state.track_pos:.2f} target={cruise_target:.3f}"
+                            )
+                        return throttle, brake, steering
+
+                    logger.info(
+                        f"Pit exit complete — handing off to model at "
+                        f"speed={state.speed:.1f}m/s lap_pct={state.lap_dist_pct:.3f} "
+                        f"track_pos={state.track_pos:.2f}"
+                    )
+                    self._pit_exit_turn_start = None
+                    # Seed the model's EMA with cruise values so the first
+                    # frame doesn't get crushed to near-zero by the smoothing
+                    # filter, which would create a death spiral through the
+                    # action history feedback loop.
+                    self.agent.ema_throttle = cruise_thr
+                    self.agent.ema_brake = 0.0
+                    self.agent.ema_steering = 0.0
+                    # Reset safety controller so it doesn't carry edge/recovery
+                    # state from the pit exit phase
+                    self.safety.reset()
+                    # Note: track_pos is handled by the forced blend that was
+                    # seeded at pit exit — it will naturally converge to the
+                    # estimator's value over the next few seconds
             return None
 
         if not self._pit_exit_active:
             self._pit_exit_active = True
+            self._pit_stall_pullout_start = None
+            self._pit_stall_pullout_done = False
             logger.info("Pit exit autopilot engaged")
+
+        # Shift to 1st if needed, then 2nd once rolling
+        if state.speed < 5.0:
+            target_gear = 1
+        else:
+            target_gear = 2
+        if target_gear != self.controller._current_gear:
+            self.controller.shift_to(target_gear)
 
         # Pit speed limit is typically 60-80 km/h (16-22 m/s)
         PIT_SPEED_LIMIT = 18.0  # m/s (~65 km/h), safe for most tracks
 
+        # --- Phase 0: Stall pullout (left swerve then right to straighten) ---
+        if not self._pit_stall_pullout_done:
+            pcfg = self._pit_exit_cfg
+            left_dur = pcfg.get("stall_pullout_left_dur", 1.2)
+            right_dur = pcfg.get("stall_pullout_right_dur", 0.8)
+            pullout_steer = pcfg.get("stall_pullout_steer", 0.35)
+            pullout_thr = pcfg.get("stall_pullout_throttle", 0.35)
+
+            # Start the pullout timer once the car begins rolling
+            if state.speed > 0.5 and self._pit_stall_pullout_start is None:
+                self._pit_stall_pullout_start = time.perf_counter()
+                logger.info("Pit stall pullout: car rolling, starting left swerve")
+
+            if self._pit_stall_pullout_start is not None:
+                elapsed = time.perf_counter() - self._pit_stall_pullout_start
+
+                if elapsed < left_dur:
+                    # Turn left to pull out of stall (one car width)
+                    steering = -pullout_steer
+                    throttle = pullout_thr
+                    brake = 0.0
+                    if self._frame_count % 30 == 0:
+                        logger.info(
+                            f"PIT STALL LEFT: steer={steering:.3f} thr={throttle:.2f} "
+                            f"elapsed={elapsed:.1f}/{left_dur:.1f}s speed={state.speed:.1f}m/s"
+                        )
+                    return throttle, brake, steering
+
+                elif elapsed < left_dur + right_dur:
+                    # Turn right to straighten on pit road
+                    steering = pullout_steer
+                    throttle = pullout_thr
+                    brake = 0.0
+                    if self._frame_count % 30 == 0:
+                        logger.info(
+                            f"PIT STALL RIGHT: steer={steering:.3f} thr={throttle:.2f} "
+                            f"elapsed={elapsed - left_dur:.1f}/{right_dur:.1f}s speed={state.speed:.1f}m/s"
+                        )
+                    return throttle, brake, steering
+
+                else:
+                    # Pullout done — continue with normal pit road driving
+                    self._pit_stall_pullout_done = True
+                    logger.info("Pit stall pullout complete, driving down pit road")
+            else:
+                # Not rolling yet — apply throttle to get moving
+                return 0.5, 0.0, 0.0
+
+        # --- Phase 1: Normal pit road driving (straight with speed limit) ---
+
         # Gentle throttle to get moving, back off near speed limit
         if state.speed < 2.0:
-            # Starting from standstill — need more throttle to get rolling
             throttle = 0.5
         elif state.speed < PIT_SPEED_LIMIT * 0.8:
             throttle = 0.4
@@ -175,19 +437,8 @@ class BotOrchestrator:
         brake = 0.0
 
         # Minimal steering correction using lateral G
-        # If car drifts left (negative lat_g), steer slightly right
-        # Gain is very small — pit lanes are straight, we just nudge
         steer_correction = -state.lat_g * 0.005
         steering = max(-0.15, min(0.15, steer_correction))
-
-        # Shift to 1st if needed, then 2nd once rolling
-        if state.speed < 5.0:
-            target_gear = 1
-        else:
-            target_gear = 2
-
-        if target_gear != self.controller._current_gear:
-            self.controller.shift_to(target_gear)
 
         if self._frame_count % 60 == 0:
             logger.info(
@@ -271,11 +522,37 @@ class BotOrchestrator:
             else:
                 logger.warning("Mock mode: running without model (random outputs)")
 
+        # Propagate normalization constants from checkpoint to telemetry
+        norm = self.agent.norm
+        if norm.get("speed_max_ms"):
+            self.telemetry._speed_max = norm["speed_max_ms"]
+            logger.info(f"Set telemetry speed_max={norm['speed_max_ms']:.1f} m/s")
+        if norm.get("steering_lock_radians"):
+            self.telemetry._steering_lock = norm["steering_lock_radians"]
+            logger.info(f"Set telemetry steering_lock={norm['steering_lock_radians']:.3f} rad")
+        if norm.get("rpm_max"):
+            self.telemetry._rpm_max = norm["rpm_max"]
+
+        # Load track map if available
+        checkpoint_dir = Path(self.cfg["paths"]["checkpoints"]) / combo_name
+        track_map_path = checkpoint_dir / "track_map.json"
+        if track_map_path.exists():
+            try:
+                track_map = TrackMap.load(str(track_map_path))
+                self.telemetry.set_track_map(track_map)
+                logger.info(f"Track map loaded: {track_map.summary().splitlines()[0]}")
+            except Exception as e:
+                logger.warning(f"Could not load track map: {e}")
+
         # Start telemetry background thread
         self.telemetry.start()
 
+        # Start manual override key listener
+        self.manual.start()
+
         logger.info("Bot active. Press Ctrl+C to stop.")
         logger.info(f"Target loop rate: {self.cfg['inference']['loop_hz']}Hz")
+        logger.info("Manual override: F1=stop F2=left F3=right F4=gas F5=hand-back")
 
         self._running = True
         self._session_start = time.perf_counter()
@@ -284,7 +561,13 @@ class BotOrchestrator:
     def _run_loop(self, combo_name: str):
         """Main control loop."""
         target_period = 1.0 / self.cfg["inference"]["loop_hz"]
-        sequence_history = self.cfg["training"]["sequence_history"]
+        # Use sequence_history from the loaded checkpoint (matches training)
+        if self.agent.is_ready and hasattr(self.agent, 'sequence_history'):
+            sequence_history = self.agent.sequence_history
+            n_state_features = self.agent.n_state_features
+        else:
+            sequence_history = self.cfg["training"]["sequence_history"]
+            n_state_features = None  # use default (all 14)
 
         last_track = ""
         last_car = ""
@@ -311,13 +594,15 @@ class BotOrchestrator:
 
             # Debug: log state flags periodically
             if self._frame_count % 300 == 0:
+                hdg_deg = np.degrees(state.heading_error)
                 logger.info(
                     f"State: on_track={state.is_on_track} "
                     f"pit_road={state.on_pit_road} "
                     f"session_active={state.session_active} "
                     f"speed={state.speed:.1f}m/s "
                     f"gear={state.gear:.0f} "
-                    f"lap_pct={state.lap_dist_pct:.3f}"
+                    f"lap_pct={state.lap_dist_pct:.3f} "
+                    f"heading_err={hdg_deg:+.1f}°"
                 )
 
             # Skip if session not active
@@ -329,7 +614,9 @@ class BotOrchestrator:
 
             # --- Pit exit autopilot ---
             # If on pit road, use simple autopilot to drive out
-            pit_result = self._pit_exit_autopilot(state)
+            # (disabled when pit_exit_autopilot is false — model drives itself)
+            pit_autopilot_enabled = self.cfg["inference"].get("pit_exit_autopilot", True)
+            pit_result = self._pit_exit_autopilot(state) if pit_autopilot_enabled else None
             if pit_result is not None:
                 throttle, brake, steering = pit_result
                 self.controller.set_inputs(throttle, brake, steering)
@@ -354,7 +641,17 @@ class BotOrchestrator:
             state_vec = self.telemetry.build_state_vector(
                 state,
                 sequence_history=sequence_history,
+                n_state_features=n_state_features,
             )
+
+            # Debug: dump full state vector on first model frame
+            if not hasattr(self, '_debug_first_model_frame'):
+                self._debug_first_model_frame = True
+                n_sf = n_state_features or 10
+                logger.info(f"STATE_VEC dim={len(state_vec)} "
+                            f"state={state_vec[:n_sf].tolist()} "
+                            f"hist[0]={state_vec[n_sf:n_sf+4].tolist()} "
+                            f"hist[1]={state_vec[n_sf+4:n_sf+8].tolist()}")
 
             # Run inference
             throttle, brake, steering = self.agent.predict(
@@ -362,12 +659,30 @@ class BotOrchestrator:
                 car_speed_ms=state.speed,
             )
 
+            # Apply safety controller — corrects outputs near track edges
+            throttle, brake, steering = self.safety.apply(
+                throttle, brake, steering, state
+            )
+
             # Debug: log model outputs periodically
             if self._frame_count % 60 == 0:
+                hdg_err = np.degrees(state.heading_error)
                 logger.info(
                     f"Output: thr={throttle:.3f} brk={brake:.3f} "
-                    f"steer={steering:.3f} speed={state.speed:.1f}"
+                    f"steer={steering:.3f} speed={state.speed:.1f} "
+                    f"track_pos={state.track_pos:.2f} "
+                    f"heading_err={hdg_err:+.1f}°"
                 )
+
+            # Manual override — bypass model if F-keys active
+            override = self.manual.get_controls()
+            if override is not None:
+                throttle, brake, steering = override
+                if self._frame_count % 60 == 0:
+                    logger.info(
+                        f"MANUAL: thr={throttle:.2f} brk={brake:.2f} "
+                        f"steer={steering:.3f}"
+                    )
 
             # Send to controller
             self.controller.set_inputs(throttle, brake, steering)
@@ -375,10 +690,21 @@ class BotOrchestrator:
             # Inject bot outputs into history buffer for next prediction
             self.telemetry.inject_bot_actions(throttle, brake, steering)
 
-            # Handle gear shifts
-            target_gear = int(round(state.gear))
-            if target_gear != self.controller._current_gear and target_gear > 0:
-                self.controller.shift_to(target_gear)
+            # Handle gear shifts — sync controller to iRacing's reported gear.
+            # iRacing manages the auto-clutch; we just need to send shift
+            # commands when the reported gear differs from what we last sent.
+            reported_gear = int(round(state.gear))
+            if reported_gear > 0:
+                # Sync controller's internal tracking to iRacing ground truth
+                # to prevent drift from missed shifts
+                self.controller._current_gear = reported_gear
+
+            # RPM-based shift logic: upshift near redline, downshift when lugging
+            if state.rpm > 0 and reported_gear > 0:
+                if state.rpm > 6800 and reported_gear < 6:
+                    self.controller.shift_up()
+                elif state.rpm < 2500 and reported_gear > 1 and state.speed > 5.0:
+                    self.controller.shift_down()
 
             # Metrics
             self._frame_count += 1
@@ -435,6 +761,9 @@ class BotOrchestrator:
         self.controller.release()
         self.controller.disconnect()
 
+        logger.info("Stopping manual override listener...")
+        self.manual.stop()
+
         logger.info("Stopping telemetry reader...")
         self.telemetry.stop()
 
@@ -444,6 +773,18 @@ class BotOrchestrator:
             f"{self._frame_count:,} frames in {elapsed:.1f}s "
             f"(avg {self._frame_count/elapsed:.0f}Hz)"
         )
+
+        # Log safety controller statistics
+        s = self.safety.stats
+        if s.total_frames > 0:
+            logger.info(
+                f"Safety stats: {s.off_track_frames} off-track frames, "
+                f"{s.edge_warning_frames} edge warnings, "
+                f"{s.edge_danger_frames} edge danger frames, "
+                f"{s.heading_error_frames} heading-error frames, "
+                f"{s.recovery_mode_activations} recovery activations "
+                f"(over {s.total_frames} total frames)"
+            )
 
 
 def main():

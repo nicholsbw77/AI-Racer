@@ -14,7 +14,7 @@ This gives the model temporal context without needing an LSTM.
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-from typing import Tuple
+from typing import Tuple, Optional
 
 from loader import STATE_FEATURES, ACTION_FEATURES, HISTORY_ACTIONS
 
@@ -119,6 +119,114 @@ class TelemetryDataset(Dataset):
     @property
     def output_dim(self) -> int:
         return self.action_dim
+
+
+def materialize_to_gpu(
+    dataset: TelemetryDataset,
+    device: torch.device,
+) -> "GPUResidentDataset":
+    """
+    Pre-compute ALL (state, action) pairs and store them as contiguous
+    GPU tensors.  Eliminates per-batch numpy→torch and CPU→GPU overhead.
+    """
+    n = len(dataset.valid_indices)
+    h = dataset.sequence_history
+
+    # Pre-allocate numpy arrays for the full materialised dataset
+    state_dim = dataset.input_dim
+    action_dim = dataset.output_dim
+    all_states = np.empty((n, state_dim), dtype=np.float32)
+    all_actions = np.empty((n, action_dim), dtype=np.float32)
+
+    for out_idx, frame_idx in enumerate(dataset.valid_indices):
+        current_state = dataset.state_arr[frame_idx]
+        history_window = dataset.history_arr[frame_idx - h:frame_idx][::-1]
+        history_flat = history_window.flatten()
+        all_states[out_idx] = np.concatenate([current_state, history_flat])
+        all_actions[out_idx] = dataset.action_arr[frame_idx]
+
+    states_t = torch.from_numpy(all_states).to(device)
+    actions_t = torch.from_numpy(all_actions).to(device)
+
+    return GPUResidentDataset(states_t, actions_t, state_dim, action_dim)
+
+
+class GPUResidentDataset(Dataset):
+    """All data lives on GPU — zero transfer overhead per batch."""
+
+    def __init__(
+        self,
+        states: torch.Tensor,
+        actions: torch.Tensor,
+        input_dim: int,
+        output_dim: int,
+    ):
+        self.states = states
+        self.actions = actions
+        self._input_dim = input_dim
+        self._output_dim = output_dim
+
+    def __len__(self) -> int:
+        return self.states.shape[0]
+
+    def __getitem__(self, idx):
+        return self.states[idx], self.actions[idx]
+
+    @property
+    def input_dim(self) -> int:
+        return self._input_dim
+
+    @property
+    def output_dim(self) -> int:
+        return self._output_dim
+
+    def batches(self, batch_size: int, shuffle: bool = True, drop_last: bool = True):
+        """
+        Yield (state_batch, action_batch) slices directly from GPU tensors.
+        No DataLoader needed — just index shuffling on CPU, slicing on GPU.
+        """
+        n = len(self)
+        if shuffle:
+            perm = torch.randperm(n, device="cpu")
+        else:
+            perm = torch.arange(n, device="cpu")
+
+        for start in range(0, n, batch_size):
+            end = start + batch_size
+            if drop_last and end > n:
+                break
+            idx = perm[start:end]
+            yield self.states[idx], self.actions[idx]
+
+
+def split_gpu_dataset(
+    gpu_ds: GPUResidentDataset,
+    val_fraction: float = 0.1,
+    seed: int = 42,
+) -> Tuple["GPUResidentDataset", "GPUResidentDataset"]:
+    """Split a GPU-resident dataset into train/val by random shuffle."""
+    n = len(gpu_ds)
+    rng = np.random.default_rng(seed)
+    indices = np.arange(n)
+    rng.shuffle(indices)
+    n_val = max(1, int(n * val_fraction))
+
+    val_idx = torch.from_numpy(indices[:n_val])
+    train_idx = torch.from_numpy(indices[n_val:])
+
+    train_ds = GPUResidentDataset(
+        gpu_ds.states[train_idx],
+        gpu_ds.actions[train_idx],
+        gpu_ds.input_dim,
+        gpu_ds.output_dim,
+    )
+    val_ds = GPUResidentDataset(
+        gpu_ds.states[val_idx],
+        gpu_ds.actions[val_idx],
+        gpu_ds.input_dim,
+        gpu_ds.output_dim,
+    )
+    return train_ds, val_ds
 
 
 def split_dataset(

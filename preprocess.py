@@ -109,7 +109,7 @@ def preprocess_combo(
             skipped += 1
             continue
 
-        df = normalize_features(df, cfg)
+        df, norm_consts = normalize_features(df, cfg)
         df = engineer_features(df)
 
         # Re-index lapIndex globally across files to avoid collisions
@@ -121,6 +121,9 @@ def preprocess_combo(
     if not all_dfs:
         logger.warning(f"No valid data for {combo_name}")
         return {}
+
+    # Use norm constants from last file (they're consistent within a combo)
+    detected_norm = norm_consts if 'norm_consts' in dir() else {}
 
     combined = pd.concat(all_dfs, ignore_index=True)
 
@@ -159,6 +162,8 @@ def preprocess_combo(
         "total_frames": len(combined),
         "personal_best_s": personal_best,
         "speed_max_ms": speed_max,
+        "steering_lock_radians": detected_norm.get("steering_lock_radians"),
+        "rpm_max": detected_norm.get("rpm_max"),
         "data_hz": cfg["training"].get("data_hz", 60),
         "sequence_history": cfg["training"]["sequence_history"],
         "features": STATE_FEATURES,

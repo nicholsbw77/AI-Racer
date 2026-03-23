@@ -2,7 +2,7 @@
 agent/telemetry.py
 
 Reads live telemetry from iRacing via pyirsdk shared memory.
-Runs at up to 360Hz synchronized to iRacing's physics tick.
+Runs at a configurable rate (default 60Hz) synchronized to iRacing's telemetry tick.
 
 Key iRacing SDK variables used:
   Speed           - m/s
@@ -17,6 +17,8 @@ Key iRacing SDK variables used:
   PlayerTrackSurface - surface type (track/pit/grass etc)
   SessionState    - session status
   IsOnTrack       - bool
+  YawRate         - rad/s yaw (for lateral position estimation)
+  Yaw             - radians, absolute heading in world coords
 """
 
 import time
@@ -38,6 +40,14 @@ except ImportError:
     logger.warning("pyirsdk not available - telemetry reader will use mock mode")
 
 
+# iRacing PlayerTrackSurface enum values
+SURFACE_NOT_IN_WORLD = -1
+SURFACE_OFF_TRACK = 0
+SURFACE_IN_PIT_STALL = 1
+SURFACE_APPROACHING_PITS = 2
+SURFACE_ON_TRACK = 3
+
+
 @dataclass
 class CarState:
     """Snapshot of car state at a single time step."""
@@ -49,8 +59,12 @@ class CarState:
     rpm: float = 0.0             # RPM
     lat_g: float = 0.0           # m/s² lateral acceleration
     lon_g: float = 0.0           # m/s² longitudinal acceleration
+    yaw_rate: float = 0.0        # rad/s yaw rotation
+    yaw: float = 0.0             # radians, absolute heading (world coords)
+    heading_error: float = 0.0   # radians, deviation from expected track heading
     lap_dist_pct: float = 0.0    # 0-1 position on track
-    track_pos: float = 0.0       # lateral offset (-1 to +1)
+    track_pos: float = 0.0       # lateral offset (-1 to +1), estimated
+    surface_type: int = 3        # iRacing surface enum (3=on track)
     is_on_track: bool = False
     on_pit_road: bool = False
     session_active: bool = False
@@ -61,12 +75,12 @@ class CarState:
 
 class TelemetryReader:
     """
-    Reads iRacing telemetry at up to 360Hz.
-    Uses wait_for_data() to sync exactly to iRacing's physics tick.
+    Reads iRacing telemetry at a configurable rate (default 60Hz).
+    Uses wait_for_data() to sync to iRacing's telemetry tick.
     Thread-safe via a lock on the latest state.
     """
 
-    def __init__(self, target_hz: int = 360):
+    def __init__(self, target_hz: int = 60):
         self.target_hz = target_hz
         self._ir = None
         self._connected = False
@@ -81,12 +95,26 @@ class TelemetryReader:
         self._steering_lock = np.pi  # radians, ~180deg default
 
         # State history for feature engineering (ring buffer)
-        self._history_len = 20
+        # Must be >= sequence_history (up to 90 frames at 360Hz/250ms)
+        self._history_len = 100
         self._throttle_hist = np.zeros(self._history_len, dtype=np.float32)
         self._brake_hist = np.zeros(self._history_len, dtype=np.float32)
         self._steering_hist = np.zeros(self._history_len, dtype=np.float32)
         self._steer_delta_hist = np.zeros(self._history_len, dtype=np.float32)
         self._hist_ptr = 0
+
+        # Track position estimator state
+        self._track_pos_estimate = 0.0
+        self._track_map = None  # Optional TrackMap for better estimation
+
+        # Forced track position override (for pit exit seeding)
+        self._forced_track_pos = None    # float or None
+        self._forced_blend = 0.0         # 1.0 = fully forced, decays to 0.0
+        self._forced_decay_rate = 0.005  # per frame (~3s to halve at 60Hz)
+
+        # Heading calibration: offset between iRacing Yaw and track map heading
+        self._yaw_offset = None          # calibrated on first good reading
+        self._yaw_calibrated = False
 
     def connect(self) -> bool:
         """Attempt to connect to iRacing. Returns True if successful."""
@@ -214,6 +242,123 @@ class TelemetryReader:
             return float(val[0]) if val else default
         return float(val)
 
+    def set_track_map(self, track_map):
+        """Attach a TrackMap for improved track position estimation."""
+        self._track_map = track_map
+        logger.info("Track map attached for position estimation")
+
+    def set_forced_track_pos(self, track_pos: float, blend: float = 1.0,
+                              decay_rate: float = 0.005):
+        """Seed the track position with a known value.
+
+        Use this when you know exactly where the car is (e.g. pit exit).
+        The forced value blends with the estimated value and decays over time.
+
+        Args:
+            track_pos: Known lateral position (-1 to +1).
+            blend: Initial blend factor (1.0 = fully forced).
+            decay_rate: Per-frame decay (0.005 ≈ 3s to halve at 60Hz).
+        """
+        self._forced_track_pos = float(track_pos)
+        self._forced_blend = float(blend)
+        self._forced_decay_rate = float(decay_rate)
+        logger.info(
+            "Forced track_pos seeded: %.2f (blend=%.2f, decay=%.4f)",
+            track_pos, blend, decay_rate,
+        )
+
+    def _estimate_track_pos(
+        self, speed: float, steering: float, lat_g: float,
+        yaw_rate: float, lap_dist_pct: float, dt: float = 1.0 / 60
+    ) -> float:
+        """
+        Estimate lateral track position from dynamics.
+
+        Uses three complementary signals:
+        1. Steering deviation from expected (if track map available)
+        2. Yaw rate integration for lateral drift detection
+        3. Lateral G vs expected curvature mismatch
+
+        The estimate drifts toward center (0.0) slowly when signals are
+        ambiguous, which is safe — the safety controller handles edge cases.
+        """
+        # Approach: integrate lateral velocity relative to track centerline
+        # lateral_vel ≈ speed * sin(slip_angle) ≈ yaw_rate * speed deviation
+        # Simplified: use steering angle as proxy for lateral intent
+
+        steer_norm = np.clip(steering / self._steering_lock, -1.0, 1.0)
+
+        if self._track_map is not None:
+            # Use track map for better estimation
+            estimated_pos = self._track_map.estimate_track_pos(
+                lap_dist_pct, speed, steering, lat_g
+            )
+        else:
+            # Fallback: integrate from yaw rate and lateral G
+            # Lateral acceleration = centripetal + lateral drift
+            # If speed > 0, lateral drift rate ≈ lat_g / speed (simplified)
+            if speed > 2.0:
+                # Estimated lateral drift in track-widths per second
+                # Typical track width ~12m, so normalize
+                lateral_drift_rate = (lat_g / max(speed, 5.0)) * dt * 0.1
+                self._track_pos_estimate += lateral_drift_rate
+
+                # Decay toward center when going straight (low steering)
+                decay = 0.995 if abs(steer_norm) > 0.05 else 0.98
+                self._track_pos_estimate *= decay
+            else:
+                # Car nearly stopped - assume centered
+                self._track_pos_estimate *= 0.95
+
+            estimated_pos = np.clip(self._track_pos_estimate, -1.0, 1.0)
+
+        # Blend with forced track position if active
+        if self._forced_blend > 0.01 and self._forced_track_pos is not None:
+            b = self._forced_blend
+            track_pos = b * self._forced_track_pos + (1.0 - b) * estimated_pos
+            # Decay the forced override — also move the forced value
+            # toward the estimate so it converges smoothly
+            self._forced_blend = max(0.0, self._forced_blend - self._forced_decay_rate)
+            self._forced_track_pos += (estimated_pos - self._forced_track_pos) * 0.01
+        else:
+            track_pos = estimated_pos
+            self._forced_blend = 0.0
+
+        return float(np.clip(track_pos, -1.0, 1.0))
+
+    def _compute_heading_error(self, yaw: float, lap_dist_pct: float,
+                                speed: float) -> float:
+        """Compute heading error between car's actual yaw and expected track heading.
+
+        Returns signed error in radians, normalized to [-pi, pi].
+        Positive = car pointing right of expected, negative = pointing left.
+        Returns 0.0 if no track map or not yet calibrated.
+        """
+        if self._track_map is None or not hasattr(self._track_map, 'get_expected_heading'):
+            return 0.0
+
+        expected_rel = self._track_map.get_expected_heading(lap_dist_pct)
+
+        # Calibrate yaw offset on first reading at reasonable speed
+        if not self._yaw_calibrated and speed > 10.0:
+            self._yaw_offset = yaw - expected_rel
+            self._yaw_calibrated = True
+            logger.info(f"Heading calibrated: yaw_offset={self._yaw_offset:.3f} rad "
+                        f"at lap_pct={lap_dist_pct:.3f}")
+            return 0.0
+
+        if not self._yaw_calibrated:
+            return 0.0
+
+        # Expected absolute yaw = expected_relative + calibration offset
+        expected_yaw = expected_rel + self._yaw_offset
+
+        # Signed difference, wrapped to [-pi, pi]
+        error = yaw - expected_yaw
+        error = (error + np.pi) % (2 * np.pi) - np.pi
+
+        return float(error)
+
     def _read_state(self) -> CarState:
         """Read current frame from iRacing shared memory."""
         ir = self._ir
@@ -227,18 +372,31 @@ class TelemetryReader:
         rpm = f(ir["RPM"])
         lat_g = f(ir["LatAccel"])
         lon_g = f(ir["LongAccel"])
+        yaw_rate = f(ir["YawRate"]) if ir["YawRate"] is not None else 0.0
+        yaw_raw = ir["Yaw"]
+        yaw = f(yaw_raw) if yaw_raw is not None else 0.0
         lap_dist_pct = f(ir["LapDistPct"])
         is_on_track = bool(f(ir["IsOnTrack"]))
         on_pit_road = bool(f(ir["OnPitRoad"] or 0))
         session_state = int(f(ir["SessionState"]))
 
-        # Track position: iRacing provides this as fraction, center=0
-        # Some SDK versions: use CarIdxTrackSurface or similar
-        track_pos = 0.0  # TODO: derive from iRacing track width data
+        # Read track surface type (PlayerTrackSurface)
+        surface_raw = ir["PlayerTrackSurface"]
+        surface_type = int(f(surface_raw)) if surface_raw is not None else SURFACE_ON_TRACK
+
+        # Track position estimation disabled — the z-score estimator is
+        # too noisy and causes the safety controller to trigger false edge
+        # warnings and the model to panic.  Zeroed until we have a reliable
+        # source (e.g. iRacing live trackPosition channel).
+        track_pos = 0.0
 
         # Update dynamic normalization constants
         self._speed_max = max(self._speed_max, speed * 1.05)
         self._rpm_max = max(self._rpm_max, rpm * 1.05)
+
+        # Heading error disabled — track map expected headings are unreliable
+        # and cause the safety controller to emergency brake on straight roads.
+        heading_error = 0.0
 
         return CarState(
             speed=speed,
@@ -249,8 +407,12 @@ class TelemetryReader:
             rpm=rpm,
             lat_g=lat_g,
             lon_g=lon_g,
+            yaw_rate=yaw_rate,
+            yaw=yaw,
+            heading_error=heading_error,
             lap_dist_pct=lap_dist_pct,
             track_pos=track_pos,
+            surface_type=surface_type,
             is_on_track=is_on_track,
             on_pit_road=on_pit_road,
             session_active=(session_state > 0),
@@ -304,10 +466,16 @@ class TelemetryReader:
         sequence_history: int = 15,
         speed_max: Optional[float] = None,
         steering_lock: Optional[float] = None,
+        n_state_features: Optional[int] = None,
     ) -> np.ndarray:
         """
         Build the full state vector for model inference.
         Mirrors the feature engineering in loader.py exactly.
+
+        Args:
+            n_state_features: If set, truncate state features to this count.
+                This handles backwards compatibility with models trained
+                before boundary features were added.
 
         Returns numpy array of shape (input_dim,)
         """
@@ -325,27 +493,37 @@ class TelemetryReader:
         steer_abs = abs(steer_norm)
 
         # Compute speed delta from recent history
-        ptr = (self._hist_ptr - 1) % self._history_len
-        prev_ptr = (self._hist_ptr - 2) % self._history_len
-        # Use throttle hist slot to estimate - or just set 0 if no history yet
         speed_delta = 0.0  # simplified; full implementation reads speed ring buffer
 
         heavy_braking = float(state.brake > 0.3 and lon_g_norm < -0.05)
         full_throttle = float(state.throttle > 0.95)
 
-        current_state = np.array([
-            state.lap_dist_pct,  # lap_dist_pct
-            speed_norm,          # speed
-            speed_delta,         # speed_delta
-            gear_norm,           # gear
-            rpm_norm,            # rpm
-            lat_g_norm,          # lat_g
-            lon_g_norm,          # lon_g
-            state.track_pos,     # track_pos
-            steer_abs,           # steering_abs
-            heavy_braking,       # heavy_braking
-            full_throttle,       # full_throttle
+        # Full 14-feature state vector (matches STATE_FEATURES in loader.py).
+        # track_pos and derived features are zeroed — no reliable live source
+        # but kept in the vector for backward compatibility with older models.
+        all_state_features = np.array([
+            state.lap_dist_pct,  # 0: lap_dist_pct
+            speed_norm,          # 1: speed
+            speed_delta,         # 2: speed_delta
+            gear_norm,           # 3: gear
+            rpm_norm,            # 4: rpm
+            lat_g_norm,          # 5: lat_g
+            lon_g_norm,          # 6: lon_g
+            0.0,                 # 7: track_pos (zeroed — estimator unreliable)
+            steer_abs,           # 8: steering_abs
+            heavy_braking,       # 9: heavy_braking
+            full_throttle,       # 10: full_throttle
+            0.0,                 # 11: near_edge (zeroed with track_pos)
+            0.0,                 # 12: on_rumble (zeroed with track_pos)
+            0.0,                 # 13: track_pos_sign (zeroed with track_pos)
         ], dtype=np.float32)
+
+        # Truncate to match the model's expected state feature count.
+        # Models trained before boundary features were added expect fewer.
+        if n_state_features is not None and n_state_features < len(all_state_features):
+            current_state = all_state_features[:n_state_features]
+        else:
+            current_state = all_state_features
 
         # Action history (newest first), matching HISTORY_ACTIONS order:
         # [throttle, brake, steering, steering_delta] × history_length

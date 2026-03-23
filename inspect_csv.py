@@ -60,7 +60,7 @@ def main():
     print(f"Loaded {len(df)} valid bins")
     print(f"Columns after mapping: {list(df.columns)}")
 
-    df = normalize_features(df, cfg)
+    df, _ = normalize_features(df, cfg)
     print("\nNormalized value ranges:")
     for col in df.columns:
         if df[col].dtype in ["float32", "float64"]:
