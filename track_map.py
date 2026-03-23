@@ -514,9 +514,9 @@ class TrackMap:
 
         # Combine: weighted sum of deviations, clipped to [-1, 1]
         # Steering deviation is the stronger signal for lateral offset
+        # Deviations are already z-scores, so the combined value is
+        # naturally in a useful range — no further scaling needed.
         track_pos = np.clip(0.6 * steer_dev + 0.4 * lat_g_dev, -1.0, 1.0)
-        # Normalize: divide by ~3 std to keep output in a useful range
-        track_pos = np.clip(track_pos / 3.0, -1.0, 1.0)
 
         return float(track_pos)
 

@@ -384,26 +384,19 @@ class TelemetryReader:
         surface_raw = ir["PlayerTrackSurface"]
         surface_type = int(f(surface_raw)) if surface_raw is not None else SURFACE_ON_TRACK
 
-        # Estimate lateral track position from dynamics
-        track_pos = self._estimate_track_pos(
-            speed, steering, lat_g, yaw_rate, lap_dist_pct
-        )
-
-        # Override track_pos if surface indicates off-track
-        if surface_type == SURFACE_OFF_TRACK:
-            # Push estimate toward edge based on steering direction
-            steer_sign = np.sign(steering) if abs(steering) > 0.01 else np.sign(self._track_pos_estimate)
-            self._track_pos_estimate = np.clip(
-                self._track_pos_estimate + steer_sign * 0.05, -1.0, 1.0
-            )
-            track_pos = self._track_pos_estimate
+        # Track position estimation disabled — the z-score estimator is
+        # too noisy and causes the safety controller to trigger false edge
+        # warnings and the model to panic.  Zeroed until we have a reliable
+        # source (e.g. iRacing live trackPosition channel).
+        track_pos = 0.0
 
         # Update dynamic normalization constants
         self._speed_max = max(self._speed_max, speed * 1.05)
         self._rpm_max = max(self._rpm_max, rpm * 1.05)
 
-        # Compute heading error: how far car's yaw deviates from expected track heading
-        heading_error = self._compute_heading_error(yaw, lap_dist_pct, speed)
+        # Heading error disabled — track map expected headings are unreliable
+        # and cause the safety controller to emergency brake on straight roads.
+        heading_error = 0.0
 
         return CarState(
             speed=speed,
@@ -505,13 +498,9 @@ class TelemetryReader:
         heavy_braking = float(state.brake > 0.3 and lon_g_norm < -0.05)
         full_throttle = float(state.throttle > 0.95)
 
-        # Track boundary awareness features
-        track_pos_abs = abs(state.track_pos)
-        near_edge = float(track_pos_abs > 0.75)       # approaching edge
-        on_rumble = float(track_pos_abs > 0.90)        # likely on rumble strip
-        track_pos_sign = np.sign(state.track_pos)      # which side (-1=left, +1=right)
-
-        # Full 14-feature state vector (current layout in loader.py)
+        # Full 14-feature state vector (matches STATE_FEATURES in loader.py).
+        # track_pos and derived features are zeroed — no reliable live source
+        # but kept in the vector for backward compatibility with older models.
         all_state_features = np.array([
             state.lap_dist_pct,  # 0: lap_dist_pct
             speed_norm,          # 1: speed
@@ -520,13 +509,13 @@ class TelemetryReader:
             rpm_norm,            # 4: rpm
             lat_g_norm,          # 5: lat_g
             lon_g_norm,          # 6: lon_g
-            state.track_pos,     # 7: track_pos
+            0.0,                 # 7: track_pos (zeroed — estimator unreliable)
             steer_abs,           # 8: steering_abs
             heavy_braking,       # 9: heavy_braking
             full_throttle,       # 10: full_throttle
-            near_edge,           # 11: near_edge (added in track nav update)
-            on_rumble,           # 12: on_rumble (added in track nav update)
-            track_pos_sign,      # 13: track_pos_sign (added in track nav update)
+            0.0,                 # 11: near_edge (zeroed with track_pos)
+            0.0,                 # 12: on_rumble (zeroed with track_pos)
+            0.0,                 # 13: track_pos_sign (zeroed with track_pos)
         ], dtype=np.float32)
 
         # Truncate to match the model's expected state feature count.

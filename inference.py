@@ -105,7 +105,7 @@ class DrivingAgent:
             n_history_actions = 4  # throttle, brake, steering, steering_delta
             ckpt_cfg = ckpt.get("cfg", {})
             stored_seq = ckpt_cfg.get("training", {}).get("sequence_history")
-            if isinstance(stored_seq, int) and stored_seq > 0:
+            if isinstance(stored_seq, int) and stored_seq >= 0:
                 self.sequence_history = stored_seq
                 self.n_state_features = ckpt["input_dim"] - stored_seq * n_history_actions
             else:

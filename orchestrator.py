@@ -189,8 +189,61 @@ class BotOrchestrator:
         Returns:
             (throttle, brake, steering) or None if pit exit is complete
         """
+        # --- Stall pullout continues even after on_pit_road goes False ---
+        # At short-pit tracks (e.g. Summit), the car can cross the pit exit
+        # boundary mid-pullout.  Let the pullout finish before starting the
+        # post-pit merge sequence.
+        if (self._pit_exit_active and not self._pit_stall_pullout_done
+                and not state.on_pit_road):
+            # Still in stall pullout but already off pit road — keep running it
+            pcfg = self._pit_exit_cfg
+            left_dur = pcfg.get("stall_pullout_left_dur", 1.2)
+            right_dur = pcfg.get("stall_pullout_right_dur", 0.8)
+            pullout_steer = pcfg.get("stall_pullout_steer", 0.35)
+            pullout_thr = pcfg.get("stall_pullout_throttle", 0.35)
+
+            # Gear management while off pit road during pullout
+            if state.speed < 5.0:
+                target_gear = 1
+            else:
+                target_gear = 2
+            if target_gear != self.controller._current_gear:
+                self.controller.shift_to(target_gear)
+
+            if self._pit_stall_pullout_start is not None:
+                elapsed = time.perf_counter() - self._pit_stall_pullout_start
+                if elapsed < left_dur:
+                    steering = -pullout_steer
+                    throttle = pullout_thr
+                    brake = 0.0
+                    if self._frame_count % 30 == 0:
+                        logger.info(
+                            f"PIT STALL LEFT (off-road): steer={steering:.3f} "
+                            f"thr={throttle:.2f} elapsed={elapsed:.1f}/{left_dur:.1f}s "
+                            f"speed={state.speed:.1f}m/s"
+                        )
+                    return throttle, brake, steering
+                elif elapsed < left_dur + right_dur:
+                    steering = pullout_steer
+                    throttle = pullout_thr
+                    brake = 0.0
+                    if self._frame_count % 30 == 0:
+                        logger.info(
+                            f"PIT STALL RIGHT (off-road): steer={steering:.3f} "
+                            f"thr={throttle:.2f} elapsed={elapsed - left_dur:.1f}/{right_dur:.1f}s "
+                            f"speed={state.speed:.1f}m/s"
+                        )
+                    return throttle, brake, steering
+                else:
+                    self._pit_stall_pullout_done = True
+                    logger.info("Pit stall pullout complete (finished off pit road)")
+                    # Fall through to start the post-pit merge below
+            else:
+                # Not rolling yet — apply throttle to get moving
+                return 0.5, 0.0, 0.0
+
         if not state.on_pit_road:
-            # We've exited the pits — start the post-pit left turn at Sebring
+            # We've exited the pits — start the post-pit merge sequence
             if self._pit_exit_active:
                 self._pit_exit_active = False
                 self._pit_exit_cfg = self._load_pit_exit_config()
@@ -260,17 +313,17 @@ class BotOrchestrator:
                     # steer left when right of line, steer right when left.
                     cruise_target = pcfg.get("cruise_until_lap_pct", 0.15)
                     cruise_thr = pcfg.get("cruise_throttle", 0.5)
-                    if state.lap_dist_pct < cruise_target:
-                        # Primary: steer toward racing line based on track_pos
-                        # track_pos > 0 = right of line → steer left (negative)
-                        # Gain 0.5: track_pos=0.6 → -0.30 steering
-                        merge_steer = -state.track_pos * 0.5
-
-                        # Secondary: dampen with lat_g to prevent oscillation
-                        lat_g_damp = -state.lat_g * 0.005
-
-                        steering = merge_steer + lat_g_damp
-                        steering = max(-0.4, min(0.4, steering))
+                    # Handle wrap-around: pit exit near end of lap (e.g. 0.95)
+                    # with cruise target past start/finish (e.g. 0.02).
+                    # If target < 0.5, car might still be in the 0.9+ range
+                    # and needs to cross the S/F line first.
+                    if cruise_target < 0.5 and state.lap_dist_pct > 0.5:
+                        still_cruising = True  # haven't crossed S/F yet
+                    else:
+                        still_cruising = state.lap_dist_pct < cruise_target
+                    if still_cruising:
+                        # Drive straight — car is already on correct heading
+                        steering = 0.0
 
                         throttle = cruise_thr
                         brake = 0.0
@@ -289,6 +342,13 @@ class BotOrchestrator:
                         f"track_pos={state.track_pos:.2f}"
                     )
                     self._pit_exit_turn_start = None
+                    # Seed the model's EMA with cruise values so the first
+                    # frame doesn't get crushed to near-zero by the smoothing
+                    # filter, which would create a death spiral through the
+                    # action history feedback loop.
+                    self.agent.ema_throttle = cruise_thr
+                    self.agent.ema_brake = 0.0
+                    self.agent.ema_steering = 0.0
                     # Reset safety controller so it doesn't carry edge/recovery
                     # state from the pit exit phase
                     self.safety.reset()
@@ -554,7 +614,9 @@ class BotOrchestrator:
 
             # --- Pit exit autopilot ---
             # If on pit road, use simple autopilot to drive out
-            pit_result = self._pit_exit_autopilot(state)
+            # (disabled when pit_exit_autopilot is false — model drives itself)
+            pit_autopilot_enabled = self.cfg["inference"].get("pit_exit_autopilot", True)
+            pit_result = self._pit_exit_autopilot(state) if pit_autopilot_enabled else None
             if pit_result is not None:
                 throttle, brake, steering = pit_result
                 self.controller.set_inputs(throttle, brake, steering)
@@ -581,6 +643,15 @@ class BotOrchestrator:
                 sequence_history=sequence_history,
                 n_state_features=n_state_features,
             )
+
+            # Debug: dump full state vector on first model frame
+            if not hasattr(self, '_debug_first_model_frame'):
+                self._debug_first_model_frame = True
+                n_sf = n_state_features or 10
+                logger.info(f"STATE_VEC dim={len(state_vec)} "
+                            f"state={state_vec[:n_sf].tolist()} "
+                            f"hist[0]={state_vec[n_sf:n_sf+4].tolist()} "
+                            f"hist[1]={state_vec[n_sf+4:n_sf+8].tolist()}")
 
             # Run inference
             throttle, brake, steering = self.agent.predict(

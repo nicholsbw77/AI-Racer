@@ -326,7 +326,7 @@ STATE_FEATURES = [
     "rpm",              # engine RPM (0-1)
     "lat_g",            # lateral G-force
     "lon_g",            # longitudinal G-force
-    "track_pos",        # lateral offset from centerline (-1 to +1)
+    "track_pos",        # lateral offset from centerline (zeroed at runtime)
     "steering_abs",     # steering magnitude (cornering context)
     "heavy_braking",    # braking zone flag
     "full_throttle",    # full throttle flag

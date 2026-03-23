@@ -1,6 +1,6 @@
 training:
   # Only train on laps within this % of your personal best
-  clean_lap_threshold: 1.01
+  clean_lap_threshold: 999.0    # use ALL laps (pit exit/entrance, slow laps, etc.)
 
   # Sample rate of your .ibt telemetry files.
   # iRacing records .ibt at 60Hz by default.
@@ -16,11 +16,11 @@ training:
   # e.g. 250ms @ 60Hz = 15 frames | 250ms @ 360Hz = 90 frames
   context_window_ms: 250
 
-  # Frames of action history - auto-computed from context_window_ms + data_hz.
-  # You can override this manually by setting it to a fixed integer instead.
-  # At 60Hz:  15 frames = ~250ms of context
-  # At 360Hz: 90 frames = ~250ms of context
-  sequence_history: auto
+  # Frames of action history — set to 0 to disable.
+  # Without action history, the model must learn to drive from current
+  # state alone (lap_dist_pct, speed, g-forces) which avoids the
+  # feedback loop where the model depends on its own prior outputs.
+  sequence_history: 0
 
   # Loss weight for penalizing jerky inputs (steering especially)
   smoothness_weight: 0.15
@@ -46,6 +46,9 @@ model:
   dropout: 0.05             # small dropout - we want to memorize expert behavior
 
 inference:
+  # Pit exit autopilot: set to false to let the model drive out of pits
+  pit_exit_autopilot: true
+
   # Exponential moving average smoothing on outputs
   # Lower = smoother but more lag, higher = more responsive but jittery
   ema_alpha: 0.30
