@@ -24,8 +24,9 @@ from torch.utils.data import DataLoader
 import yaml
 
 from loader import load_track_car_dataset
-from dataset import TelemetryDataset, split_dataset
+from dataset import TelemetryDataset, split_dataset, build_track_features_for_dataset
 from model import DrivingPolicyNet, BehaviorCloningLoss
+from track_map import TrackMap
 
 logging.basicConfig(
     level=logging.INFO,
@@ -87,8 +88,34 @@ def train_one_combo(
         logger.warning(f"Skipping {combo_name}: no data")
         return False
 
+    # --- Track features ---
+    track_features = None
+    track_cfg = cfg.get("track", {})
+    lookahead = track_cfg.get("lookahead_segments", 5)
+
+    # Look for track map in checkpoints or processed data folder
+    for map_dir in [
+        Path(cfg["paths"]["checkpoints"]) / combo_name,
+        Path(combo_folder),
+    ]:
+        map_path = map_dir / "track_map.yaml"
+        if map_path.exists():
+            tmap = TrackMap()
+            if tmap.load(str(map_path)):
+                track_features = build_track_features_for_dataset(
+                    df, tmap, lookahead=lookahead
+                )
+                logger.info(
+                    f"Track features: {track_features.shape[1]} dims "
+                    f"(lookahead={lookahead}) from {map_path}"
+                )
+            break
+
     try:
-        full_dataset = TelemetryDataset(df, train_cfg["sequence_history"])
+        full_dataset = TelemetryDataset(
+            df, train_cfg["sequence_history"],
+            track_features=track_features,
+        )
     except ValueError as e:
         logger.warning(f"Skipping {combo_name}: {e}")
         return False
