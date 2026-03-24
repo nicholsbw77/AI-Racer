@@ -71,9 +71,30 @@ inference:
   steering_min: -1.0
   steering_max: 1.0
 
+  # Steering axis inversion.
+  # iRacing records SteeringWheelAngle as negative for RIGHT turns.
+  # If the vJoy axis maps negative → LEFT (wrong direction), set this to true
+  # to flip all steering output before it reaches vJoy.
+  # Test: does the car turn RIGHT when you expect it to? If not, flip this.
+  steer_invert: true
+
+  # Map-guided launch phase: minimum speed (m/s) before handing off to the model.
+  # Set high enough that the launch phase covers all slow-speed corners coming
+  # out of the pits and reaches a fast straight where the model has solid data.
+  # Jefferson Rev: chicane ends ~pct=0.20 at ~38m/s; long straight peaks at 50m/s.
+  # Raise this if the model is handed off too early (misses a corner after launch).
+  launch_min_speed_ms: 38.0
+
+  # Map-guided launch phase: steering speed-scaling exponent.
+  # steer = ref_steer * (speed / ref_speed) ^ launch_steer_power
+  # 1.0 = linear (too little steer at low speed)
+  # 0.5 = square-root (more steer at low speed, good starting point)
+  # 0.0 = full ref_steer always (no scaling)
+  launch_steer_power: 0.5
+
   # Safety cutoff - if speed < this (m/s), release all inputs
   # Prevents runaway if session ends or car stalls
-  min_speed_cutoff: 2.0
+  min_speed_cutoff: 1.0
 
 # ------------------------------------------------------------------
 # Safety Controller Configuration

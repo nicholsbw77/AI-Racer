@@ -88,6 +88,26 @@ def train_one_combo(
         logger.warning(f"Skipping {combo_name}: no data")
         return False
 
+    # --- Normalization constants from meta.yaml ---
+    # These must be saved in the checkpoint so inference uses the EXACT same
+    # scales as training (speed_max, steering_lock, rpm_max).
+    norm_constants = {}
+    meta_path = Path(combo_folder) / "meta.yaml"
+    if meta_path.exists():
+        with open(meta_path) as _mf:
+            _meta = yaml.safe_load(_mf)
+        norm_constants = {
+            "speed_max_ms":           _meta.get("speed_max_ms"),
+            "steering_lock_radians":  _meta.get("steering_lock_radians"),
+            "rpm_max":                _meta.get("rpm_max"),
+        }
+        logger.info(
+            f"Norm constants from meta.yaml: "
+            f"speed_max={norm_constants['speed_max_ms']:.2f} m/s  "
+            f"steer_lock={norm_constants['steering_lock_radians']:.4f} rad  "
+            f"rpm_max={norm_constants['rpm_max']:.0f}"
+        )
+
     # --- Track features ---
     track_features = None
     track_cfg = cfg.get("track", {})
@@ -193,7 +213,7 @@ def train_one_combo(
         # Train
         model.train()
         train_loss_sum = 0.0
-        train_components = {"throttle": 0, "brake": 0, "steering": 0, "smoothness": 0}
+        train_components = {"throttle": 0, "brake": 0, "steering": 0, "smoothness": 0, "boundary": 0}
         t0 = time.time()
 
         for batch_state, batch_action in train_loader:
@@ -263,6 +283,7 @@ def train_one_combo(
                 "output_dim": full_dataset.output_dim,
                 "cfg": cfg,
                 "combo_name": combo_name,
+                "norm": norm_constants,
             }, best_path)
         else:
             epochs_no_improve += 1
@@ -282,6 +303,7 @@ def train_one_combo(
         "output_dim": full_dataset.output_dim,
         "cfg": cfg,
         "combo_name": combo_name,
+        "norm": norm_constants,
     }, last_path)
 
     logger.info(f"✓ Best val loss: {best_val_loss:.5f}  Checkpoint: {best_path}")

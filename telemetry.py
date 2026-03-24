@@ -365,6 +365,19 @@ class TelemetryReader:
 
         self._hist_ptr += 1
 
+    def prewarm_history(self, throttle: float, brake: float, steering_normalized: float):
+        """Fill the entire history ring buffer with the given values.
+
+        Call this once when transitioning from pit exit to model control so the
+        model sees a plausible recent-history (not a buffer full of pit-exit
+        zeros) when it makes its first prediction.
+        """
+        with self._lock:
+            self._throttle_hist[:] = throttle
+            self._brake_hist[:] = brake
+            self._steering_hist[:] = steering_normalized
+            self._steer_delta_hist[:] = 0.0
+
     def inject_bot_actions(self, throttle: float, brake: float, steering: float):
         """Inject the bot's output into the history buffer.
 

@@ -1,0 +1,127 @@
+---
+CalibrationInfo:
+ DeviceList:
+ - DeviceName: 'FANATEC ClubSport Pedals V3'
+   InstanceGUID: '{550484B0-6CC5-11ED-8001-444553540000}'
+   AxisList:
+   - Axis: 2
+     AxisName: 'Y Axis'
+     CalibMin: 0
+     CalibCenter: 0
+     CalibMax: 4095
+   - Axis: 3
+     AxisName: 'X Axis'
+     CalibMin: 0
+     CalibCenter: 0
+     CalibMax: 4095
+ - DeviceName: 'SimXperience AccuForce'
+   InstanceGUID: '{BCEB61B0-6366-11ED-8001-444553540000}'
+   AxisList:
+   - Axis: 2
+     AxisName: 'X Axis'
+     CalibMin: 0
+     CalibCenter: 32800
+     CalibMax: 65534
+ - DeviceName: 'SimXperience AccuForce'
+   InstanceGUID: '{BCEB88C0-6366-11ED-8002-444553540000}'
+   AxisList:
+   - Axis: 2
+     AxisName: 'X Axis'
+     CalibMin: 0
+     CalibCenter: 32740
+     CalibMax: 65534
+ - DeviceName: 'ClubSportPedal'
+   InstanceGUID: '{802560C0-62FB-11ED-8002-444553540000}'
+   AxisList:
+   - Axis: 2
+     AxisName: 'Y Axis'
+     CalibMin: 3
+     CalibCenter: 55
+     CalibMax: 2103
+   - Axis: 3
+     AxisName: 'X Axis'
+     CalibMin: 0
+     CalibCenter: 0
+     CalibMax: 4095
+ - DeviceName: 'Bluetooth LE XINPUT compatible input device'
+   InstanceGUID: '{F3791CB0-6369-11ED-8004-444553540000}'
+   AxisList:
+   - Axis: 1
+     AxisName: 'X Axis'
+     CalibMin: 0
+     CalibCenter: 33013
+     CalibMax: 65535
+   - Axis: 3
+     AxisName: 'X Rotation'
+     CalibMin: 0
+     CalibCenter: 32687
+     CalibMax: 65535
+   - Axis: 4
+     AxisName: 'Z Axis'
+     CalibMin: 128
+     CalibCenter: 32768
+     CalibMax: 65408
+ - DeviceName: 'ClubSportPedal'
+   InstanceGUID: '{CC273A50-62BC-11ED-8002-444553540000}'
+   AxisList:
+   - Axis: 2
+     AxisName: 'Y Axis'
+     CalibMin: 0
+     CalibCenter: 0
+     CalibMax: 4095
+   - Axis: 3
+     AxisName: 'X Axis'
+     CalibMin: 0
+     CalibCenter: 0
+     CalibMax: 4095
+ - DeviceName: 'SimXperience AccuForce'
+   InstanceGUID: '{CC27FDA0-62BC-11ED-800F-444553540000}'
+   AxisList:
+   - Axis: 2
+     AxisName: 'X Axis'
+     CalibMin: 0
+     CalibCenter: 32737
+     CalibMax: 65534
+ - DeviceName: 'FANATEC ClubSport Pedals V3'
+   InstanceGUID: '{7B527800-2EC5-11EC-8001-444553540000}'
+   AxisList:
+   - Axis: 2
+     AxisName: 'Y Axis'
+     CalibMin: 0
+     CalibCenter: 0
+     CalibMax: 4095
+   - Axis: 3
+     AxisName: 'X Axis'
+     CalibMin: 0
+     CalibCenter: 0
+     CalibMax: 4095
+ - DeviceName: 'SimXperience AccuForce'
+   InstanceGUID: '{02572380-2E96-11EC-8009-444553540000}'
+   AxisList:
+   - Axis: 2
+     AxisName: 'X Axis'
+     CalibMin: 0
+     CalibCenter: 32709
+     CalibMax: 65534
+ - DeviceName: 'SimXperience AccuForce'
+   InstanceGUID: '{02572380-2E96-11EC-8008-444553540000}'
+   AxisList:
+   - Axis: 2
+     AxisName: 'X Axis'
+     CalibMin: 0
+     CalibCenter: 32752
+     CalibMax: 65534
+ - DeviceName: 'ClubSportPedal'
+   InstanceGUID: '{F4B04400-2E95-11EC-8007-444553540000}'
+   AxisList:
+   - Axis: 2
+     AxisName: 'Y Axis'
+     CalibMin: 0
+     CalibCenter: 0
+     CalibMax: 4095
+   - Axis: 3
+     AxisName: 'X Axis'
+     CalibMin: 0
+     CalibCenter: 0
+     CalibMax: 4095
+...

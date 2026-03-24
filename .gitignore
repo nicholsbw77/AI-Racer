@@ -38,5 +38,11 @@ Thumbs.db
 # Archives
 *.zip
 
+# Large binary/data folders (too big for git)
+data.bak/
+lapfiles/
+replay/
+tracks/
+
 # Misc
 *.log
