@@ -108,7 +108,12 @@ def load_ibt_file(filepath: str) -> Optional[pd.DataFrame]:
         try:
             values = ibt.get_all(iracing_name)
             if values is not None:
-                data[canonical_name] = np.array(values, dtype=np.float32)
+                arr = np.array(values, dtype=np.float32)
+                # Some iRacing channels return 2D arrays (e.g. per-wheel data).
+                # We only want scalar-per-tick channels — flatten or take first col.
+                if arr.ndim > 1:
+                    arr = arr[:, 0] if arr.shape[1] > 0 else arr.flatten()
+                data[canonical_name] = arr
         except Exception:
             logger.debug(f"Could not read channel {iracing_name} from {path.name}")
 
