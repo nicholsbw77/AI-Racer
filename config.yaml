@@ -50,6 +50,12 @@ inference:
   # Lower = smoother but more lag, higher = more responsive but jittery
   ema_alpha: 0.30
 
+  # Adaptive EMA: different alpha values for different track sections
+  # Braking zones and corners need faster response, straights can be smoother
+  ema_alpha_corner: 0.40
+  ema_alpha_braking: 0.50
+  ema_alpha_straight: 0.20
+
   # Target control loop frequency (Hz) - iRacing physics tick
   loop_hz: 60
 
@@ -68,6 +74,76 @@ inference:
   # Safety cutoff - if speed < this (m/s), release all inputs
   # Prevents runaway if session ends or car stalls
   min_speed_cutoff: 2.0
+
+# ------------------------------------------------------------------
+# Safety Controller Configuration
+# ------------------------------------------------------------------
+safety:
+  # Heartbeat watchdog: kill if no fresh telemetry for this many ms
+  heartbeat_timeout_ms: 200.0
+  heartbeat_max_failures: 3
+
+  # Speed envelope
+  min_speed_cutoff_ms: 2.0     # below this, only gentle throttle
+  crawl_speed_ms: 5.0          # below this, reduce steering authority
+  crawl_throttle: 0.3          # throttle when below min_speed
+  zero_speed_kill_frames: 300  # kill after this many frames at zero speed (5s @ 60Hz)
+
+  # G-force limits (m/s^2)
+  # ~1g = 9.81 m/s^2, racing cars can pull 3-4g
+  max_lat_g: 35.0              # ~3.5g lateral limit
+  max_lon_g: 40.0              # ~4.0g longitudinal limit
+  g_force_throttle_reduction: 0.5  # max throttle reduction at G limit
+
+  # Steering rate limiter
+  # Max steering change per tick (normalized -1 to 1 scale)
+  # Prevents snap oversteer from model oscillations
+  max_steering_rate: 0.15
+  emergency_steering_rate: 0.25  # allowed during hard braking
+
+  # Brake/throttle mutual exclusion
+  brake_throttle_threshold: 0.3  # brake above this reduces throttle
+
+  # Spin detection
+  spin_yaw_rate_threshold: 2.0   # rad/s yaw rate that indicates a spin
+  spin_detect_frames: 10         # consecutive frames to confirm spin
+  spin_recovery_timeout: 180     # max recovery frames (3s @ 60Hz)
+
+  # Stuck detection
+  stuck_speed_threshold: 1.0     # m/s - below this = possibly stuck
+  stuck_detect_frames: 600       # frames to confirm stuck (10s @ 60Hz)
+
+  # Lap time watchdog
+  # Kill if current lap takes longer than this multiplier of personal best
+  lap_time_kill_multiplier: 2.5
+
+  # Track boundary monitoring
+  track_edge_warning: 0.85       # boundary_pct above this = warning
+  track_edge_critical: 0.95      # boundary_pct above this = critical reduction
+  off_track_kill_frames: 60      # kill after this many off-track frames
+  boundary_speed_reduction: 0.6  # max throttle reduction at track edge
+
+  # Pit lane
+  pit_speed_limit_ms: 18.0      # ~65 km/h pit speed limit
+
+  # Incident management
+  incident_cooldown_s: 5.0       # seconds between incident detections
+  max_incidents_per_session: 10  # kill session after this many incidents
+
+# ------------------------------------------------------------------
+# Track Map / GPS Positioning Configuration
+# ------------------------------------------------------------------
+track:
+  # Number of segments to divide the track into
+  # Higher = more granular but needs more training data
+  num_segments: 100
+
+  # How many segments ahead to include in the state vector
+  # More lookahead = better anticipation of corners/braking
+  lookahead_segments: 5
+
+  # Auto-build track map during preprocessing
+  auto_build_map: true
 
 features:
   # All VRS/iRacing column names mapped to our normalized names

@@ -24,8 +24,9 @@ from torch.utils.data import DataLoader
 import yaml
 
 from loader import load_track_car_dataset
-from dataset import TelemetryDataset, split_dataset, materialize_to_gpu, split_gpu_dataset
+from dataset import TelemetryDataset, split_dataset, build_track_features_for_dataset
 from model import DrivingPolicyNet, BehaviorCloningLoss
+from track_map import TrackMap
 
 logging.basicConfig(
     level=logging.INFO,
@@ -77,12 +78,6 @@ def train_one_combo(
 
     # --- Data ---
     parquet_path = os.path.join(combo_folder, "data.parquet")
-    meta_path = os.path.join(combo_folder, "meta.yaml")
-    norm_meta = {}
-    if os.path.exists(meta_path):
-        with open(meta_path) as f:
-            norm_meta = yaml.safe_load(f) or {}
-
     if os.path.exists(parquet_path):
         import pandas as pd
         df = pd.read_parquet(parquet_path)
@@ -93,58 +88,65 @@ def train_one_combo(
         logger.warning(f"Skipping {combo_name}: no data")
         return False
 
+    # --- Track features ---
+    track_features = None
+    track_cfg = cfg.get("track", {})
+    lookahead = track_cfg.get("lookahead_segments", 5)
+
+    # Look for track map in checkpoints or processed data folder
+    for map_dir in [
+        Path(cfg["paths"]["checkpoints"]) / combo_name,
+        Path(combo_folder),
+    ]:
+        map_path = map_dir / "track_map.yaml"
+        if map_path.exists():
+            tmap = TrackMap()
+            if tmap.load(str(map_path)):
+                track_features = build_track_features_for_dataset(
+                    df, tmap, lookahead=lookahead
+                )
+                logger.info(
+                    f"Track features: {track_features.shape[1]} dims "
+                    f"(lookahead={lookahead}) from {map_path}"
+                )
+            break
+
     try:
-        full_dataset = TelemetryDataset(df, train_cfg["sequence_history"])
+        full_dataset = TelemetryDataset(
+            df, train_cfg["sequence_history"],
+            track_features=track_features,
+        )
     except ValueError as e:
         logger.warning(f"Skipping {combo_name}: {e}")
         return False
 
-    # ---- GPU-resident fast path ----
-    # Materialize entire dataset to GPU, then split.
-    # Eliminates DataLoader workers, numpy→torch, and CPU→GPU transfers.
-    use_gpu_resident = device.type == "cuda"
+    train_set, val_set = split_dataset(
+        full_dataset,
+        val_fraction=train_cfg["val_split"],
+        seed=train_cfg["seed"],
+    )
 
-    if use_gpu_resident:
-        logger.info("Materializing full dataset to GPU...")
-        gpu_ds = materialize_to_gpu(full_dataset, device)
-        train_set, val_set = split_gpu_dataset(
-            gpu_ds,
-            val_fraction=train_cfg["val_split"],
-            seed=train_cfg.get("seed", 42),
-        )
-        logger.info(f"Train samples: {len(train_set):,}  |  Val samples: {len(val_set):,}")
-        logger.info(f"Input dim: {full_dataset.input_dim}  |  Output dim: {full_dataset.output_dim}")
-        vram_mb = (train_set.states.nbytes + train_set.actions.nbytes +
-                   val_set.states.nbytes + val_set.actions.nbytes) / 1024**2
-        logger.info(f"GPU VRAM used for data: {vram_mb:.1f} MB")
-        train_loader = None  # use .batches() instead
-        val_loader = None
-    else:
-        train_set_cpu, val_set_cpu = split_dataset(
-            full_dataset,
-            val_fraction=train_cfg["val_split"],
-            seed=train_cfg.get("seed", 42),
-        )
-        train_set = train_set_cpu
-        val_set = val_set_cpu
-        logger.info(f"Train samples: {len(train_set):,}  |  Val samples: {len(val_set):,}")
-        logger.info(f"Input dim: {full_dataset.input_dim}  |  Output dim: {full_dataset.output_dim}")
-        num_workers = 0 if sys.platform == "win32" else 4
-        train_loader = DataLoader(
-            train_set,
-            batch_size=train_cfg["batch_size"],
-            shuffle=True,
-            num_workers=num_workers,
-            pin_memory=True,
-            drop_last=True,
-        )
-        val_loader = DataLoader(
-            val_set,
-            batch_size=train_cfg["batch_size"] * 2,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=True,
-        )
+    logger.info(f"Train samples: {len(train_set):,}  |  Val samples: {len(val_set):,}")
+    logger.info(f"Input dim: {full_dataset.input_dim}  |  Output dim: {full_dataset.output_dim}")
+
+    # num_workers=0 on Windows avoids slow multiprocessing spawn overhead;
+    # dataset fits in memory so DataLoader overhead is minimal
+    num_workers = 0 if sys.platform == "win32" else 4
+    train_loader = DataLoader(
+        train_set,
+        batch_size=train_cfg["batch_size"],
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=True,
+    )
+    val_loader = DataLoader(
+        val_set,
+        batch_size=train_cfg["batch_size"] * 2,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
 
     # --- Model ---
     model = DrivingPolicyNet(
@@ -160,7 +162,6 @@ def train_one_combo(
         brake_weight=train_cfg["brake_loss_weight"],
         steering_weight=train_cfg["steering_loss_weight"],
         smoothness_weight=train_cfg["smoothness_weight"],
-        boundary_weight=train_cfg.get("boundary_weight", 0.3),
     )
 
     optimizer = torch.optim.AdamW(
@@ -192,35 +193,25 @@ def train_one_combo(
         # Train
         model.train()
         train_loss_sum = 0.0
-        train_components = {"throttle": 0, "brake": 0, "steering": 0, "smoothness": 0, "boundary": 0}
+        train_components = {"throttle": 0, "brake": 0, "steering": 0, "smoothness": 0}
         t0 = time.time()
 
-        # Select batch iterator based on data location
-        if use_gpu_resident:
-            train_batches = train_set.batches(train_cfg["batch_size"], shuffle=True, drop_last=True)
-        else:
-            train_batches = train_loader
-
-        n_batches = 0
-        n_state = full_dataset.state_arr.shape[1]
-        track_pos_idx = 7  # track_pos position in STATE_FEATURES
-
-        for batch_state, batch_action in train_batches:
-            if not use_gpu_resident:
-                batch_state = batch_state.to(device, non_blocking=True)
-                batch_action = batch_action.to(device, non_blocking=True)
+        for batch_state, batch_action in train_loader:
+            batch_state = batch_state.to(device, non_blocking=True)
+            batch_action = batch_action.to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
 
             pred_thr, pred_brk, pred_str = model(batch_state)
 
             # Use previous steering from history as smoothness reference
-            prev_str = batch_state[:, n_state + 2:n_state + 3]
-            batch_track_pos = batch_state[:, track_pos_idx:track_pos_idx + 1]
+            # History index: last steering value is at state[n_state_features + 2]
+            # (history is [t-1: throttle, brake, steering, steer_delta, ...])
+            prev_str = batch_state[:, full_dataset.state_arr.shape[1] + 2:
+                                      full_dataset.state_arr.shape[1] + 3]
 
             loss, components = criterion(
-                pred_thr, pred_brk, pred_str, batch_action, prev_str,
-                track_pos=batch_track_pos,
+                pred_thr, pred_brk, pred_str, batch_action, prev_str
             )
 
             loss.backward()
@@ -230,32 +221,23 @@ def train_one_combo(
             train_loss_sum += loss.item()
             for k in components:
                 train_components[k] += components[k]
-            n_batches += 1
 
-        train_loss = train_loss_sum / max(n_batches, 1)
+        n_batches = len(train_loader)
+        train_loss = train_loss_sum / n_batches
 
         # Validate
         model.eval()
         val_loss_sum = 0.0
-        n_val_batches = 0
-
-        if use_gpu_resident:
-            val_batches = val_set.batches(train_cfg["batch_size"] * 2, shuffle=False, drop_last=False)
-        else:
-            val_batches = val_loader
-
         with torch.no_grad():
-            for batch_state, batch_action in val_batches:
-                if not use_gpu_resident:
-                    batch_state = batch_state.to(device, non_blocking=True)
-                    batch_action = batch_action.to(device, non_blocking=True)
+            for batch_state, batch_action in val_loader:
+                batch_state = batch_state.to(device, non_blocking=True)
+                batch_action = batch_action.to(device, non_blocking=True)
 
                 pred_thr, pred_brk, pred_str = model(batch_state)
                 loss, _ = criterion(pred_thr, pred_brk, pred_str, batch_action)
                 val_loss_sum += loss.item()
-                n_val_batches += 1
 
-        val_loss = val_loss_sum / max(n_val_batches, 1)
+        val_loss = val_loss_sum / len(val_loader)
         scheduler.step(val_loss)
 
         # Logging
@@ -281,12 +263,6 @@ def train_one_combo(
                 "output_dim": full_dataset.output_dim,
                 "cfg": cfg,
                 "combo_name": combo_name,
-                "norm": {
-                    "speed_max_ms": norm_meta.get("speed_max_ms"),
-                    "steering_lock_radians": norm_meta.get("steering_lock_radians"),
-                    "rpm_max": norm_meta.get("rpm_max"),
-                    "data_hz": norm_meta.get("data_hz", train_cfg.get("data_hz", 60)),
-                },
             }, best_path)
         else:
             epochs_no_improve += 1
@@ -309,17 +285,6 @@ def train_one_combo(
     }, last_path)
 
     logger.info(f"✓ Best val loss: {best_val_loss:.5f}  Checkpoint: {best_path}")
-
-    # Build and save track map for live inference
-    try:
-        from track_map import TrackMap
-        tm = TrackMap.build_from_dataframe(df)
-        track_map_path = checkpoint_dir / "track_map.json"
-        tm.save(str(track_map_path))
-        logger.info(f"✓ Track map saved: {track_map_path}")
-    except Exception as e:
-        logger.warning(f"Could not build track map: {e}")
-
     return True
 
 
@@ -331,6 +296,8 @@ def main():
                         help="Track ID filter (e.g. 'sebring')")
     parser.add_argument("--car", default=None,
                         help="Car ID filter (e.g. 'mx5')")
+    parser.add_argument("--combo", default=None,
+                        help="Combo name filter (e.g. 'cadillacctsvr_summitpoint')")
     parser.add_argument("--all", action="store_true",
                         help="Train all track/car combos found in data folder")
     parser.add_argument("--config", default="config.yaml")
@@ -357,6 +324,11 @@ def main():
     # Find combos to train
     if args.all:
         combos = [d for d in data_root.iterdir() if d.is_dir()]
+    elif args.combo:
+        combos = [
+            d for d in data_root.iterdir()
+            if d.is_dir() and args.combo.lower() in d.name.lower()
+        ]
     elif args.track or args.car:
         pattern = f"{args.track or '*'}_{args.car or '*'}"
         combos = list(data_root.glob(pattern))
@@ -369,7 +341,7 @@ def main():
                 and (args.car is None or args.car.lower() in d.name.lower())
             ]
     else:
-        logger.error("Specify --track/--car or --all")
+        logger.error("Specify --combo, --track/--car, or --all")
         sys.exit(1)
 
     if not combos:

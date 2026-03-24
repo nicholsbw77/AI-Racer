@@ -4,11 +4,15 @@ trainer/dataset.py
 PyTorch Dataset that builds (state_vector, action_vector) pairs from
 processed telemetry DataFrames.
 
-At 360Hz with sequence_history=15, each sample includes ~42ms of context.
+At 60Hz with sequence_history=15, each sample includes ~250ms of context.
 The state vector is:
-  [current_state_features] + [history_actions × history_length]
+  [current_state_features] + [history_actions x history_length] + [optional track_features]
 
 This gives the model temporal context without needing an LSTM.
+
+Enhanced with:
+  - Optional track map features appended to state vector
+  - Support for extended state features (yaw_rate, slip_angle)
 """
 
 import numpy as np
@@ -24,19 +28,28 @@ class TelemetryDataset(Dataset):
     Dataset of (state, action) pairs built from cleaned telemetry DataFrame.
 
     State vector layout (per sample):
-      Indices 0..N_state-1        : current frame state features
-      Indices N_state..end        : flattened action history
-                                    [t-1, t-2, ..., t-history] × HISTORY_ACTIONS
+      Indices 0..N_state-1             : current frame state features
+      Indices N_state..N_state+N_hist-1: flattened action history
+                                         [t-1, t-2, ..., t-history] x HISTORY_ACTIONS
+      Indices N_state+N_hist..end      : optional track features
 
     Action vector:
       [throttle, brake, steering]  (all in [0,1] or [-1,1])
     """
 
-    def __init__(self, df, sequence_history: int = 15):
+    def __init__(
+        self,
+        df,
+        sequence_history: int = 15,
+        track_features: Optional[np.ndarray] = None,
+    ):
         """
         Args:
             df: Cleaned, normalized DataFrame from loader.py
             sequence_history: How many previous frames of actions to include
+            track_features: Optional pre-computed track features array of shape
+                           (n_frames, n_track_features). If provided, these are
+                           appended to each state vector.
         """
         self.sequence_history = sequence_history
 
@@ -53,6 +66,12 @@ class TelemetryDataset(Dataset):
         self.action_arr = df[action_cols].values.astype(np.float32)
         self.history_arr = df[history_cols].values.astype(np.float32)
 
+        # Optional track features
+        self.track_features = track_features
+        self._track_feat_dim = 0
+        if track_features is not None:
+            self._track_feat_dim = track_features.shape[1]
+
         # Track lap boundaries so we don't build sequences across lap transitions
         if "lapIndex" in df.columns:
             self.lap_ids = df["lapIndex"].values
@@ -65,7 +84,8 @@ class TelemetryDataset(Dataset):
         # Compute input dimension for model construction
         self.state_dim = (
             self.state_arr.shape[1] +
-            len(history_cols) * sequence_history
+            len(history_cols) * sequence_history +
+            self._track_feat_dim
         )
         self.action_dim = self.action_arr.shape[1]
 
@@ -102,7 +122,13 @@ class TelemetryDataset(Dataset):
         history_flat = history_window.flatten()
 
         # Concatenate into full state vector
-        full_state = np.concatenate([current_state, history_flat])
+        parts = [current_state, history_flat]
+
+        # Optional track features
+        if self.track_features is not None:
+            parts.append(self.track_features[frame_idx])
+
+        full_state = np.concatenate(parts)
 
         # Target action
         action = self.action_arr[frame_idx]
@@ -121,112 +147,36 @@ class TelemetryDataset(Dataset):
         return self.action_dim
 
 
-def materialize_to_gpu(
-    dataset: TelemetryDataset,
-    device: torch.device,
-) -> "GPUResidentDataset":
+def build_track_features_for_dataset(
+    df,
+    track_map,
+    lookahead: int = 5,
+) -> np.ndarray:
     """
-    Pre-compute ALL (state, action) pairs and store them as contiguous
-    GPU tensors.  Eliminates per-batch numpy→torch and CPU→GPU overhead.
+    Build track-aware features for every frame in the DataFrame.
+
+    Args:
+        df: DataFrame with 'lap_dist_pct' and 'speed' columns
+        track_map: A built TrackMap instance
+        lookahead: Number of segments to look ahead
+
+    Returns:
+        numpy array of shape (n_frames, n_track_features)
     """
-    n = len(dataset.valid_indices)
-    h = dataset.sequence_history
+    n = len(df)
+    sample_features = track_map.get_track_features(0.0, 0.0, lookahead)
+    feat_dim = len(sample_features)
+    result = np.zeros((n, feat_dim), dtype=np.float32)
 
-    # Pre-allocate numpy arrays for the full materialised dataset
-    state_dim = dataset.input_dim
-    action_dim = dataset.output_dim
-    all_states = np.empty((n, state_dim), dtype=np.float32)
-    all_actions = np.empty((n, action_dim), dtype=np.float32)
+    lap_dist_pcts = df["lap_dist_pct"].values
+    speeds = df["speed"].values if "speed" in df.columns else np.zeros(n)
 
-    for out_idx, frame_idx in enumerate(dataset.valid_indices):
-        current_state = dataset.state_arr[frame_idx]
-        history_window = dataset.history_arr[frame_idx - h:frame_idx][::-1]
-        history_flat = history_window.flatten()
-        all_states[out_idx] = np.concatenate([current_state, history_flat])
-        all_actions[out_idx] = dataset.action_arr[frame_idx]
+    for i in range(n):
+        result[i] = track_map.get_track_features(
+            lap_dist_pcts[i], speeds[i], lookahead
+        )
 
-    states_t = torch.from_numpy(all_states).to(device)
-    actions_t = torch.from_numpy(all_actions).to(device)
-
-    return GPUResidentDataset(states_t, actions_t, state_dim, action_dim)
-
-
-class GPUResidentDataset(Dataset):
-    """All data lives on GPU — zero transfer overhead per batch."""
-
-    def __init__(
-        self,
-        states: torch.Tensor,
-        actions: torch.Tensor,
-        input_dim: int,
-        output_dim: int,
-    ):
-        self.states = states
-        self.actions = actions
-        self._input_dim = input_dim
-        self._output_dim = output_dim
-
-    def __len__(self) -> int:
-        return self.states.shape[0]
-
-    def __getitem__(self, idx):
-        return self.states[idx], self.actions[idx]
-
-    @property
-    def input_dim(self) -> int:
-        return self._input_dim
-
-    @property
-    def output_dim(self) -> int:
-        return self._output_dim
-
-    def batches(self, batch_size: int, shuffle: bool = True, drop_last: bool = True):
-        """
-        Yield (state_batch, action_batch) slices directly from GPU tensors.
-        No DataLoader needed — just index shuffling on CPU, slicing on GPU.
-        """
-        n = len(self)
-        if shuffle:
-            perm = torch.randperm(n, device="cpu")
-        else:
-            perm = torch.arange(n, device="cpu")
-
-        for start in range(0, n, batch_size):
-            end = start + batch_size
-            if drop_last and end > n:
-                break
-            idx = perm[start:end]
-            yield self.states[idx], self.actions[idx]
-
-
-def split_gpu_dataset(
-    gpu_ds: GPUResidentDataset,
-    val_fraction: float = 0.1,
-    seed: int = 42,
-) -> Tuple["GPUResidentDataset", "GPUResidentDataset"]:
-    """Split a GPU-resident dataset into train/val by random shuffle."""
-    n = len(gpu_ds)
-    rng = np.random.default_rng(seed)
-    indices = np.arange(n)
-    rng.shuffle(indices)
-    n_val = max(1, int(n * val_fraction))
-
-    val_idx = torch.from_numpy(indices[:n_val])
-    train_idx = torch.from_numpy(indices[n_val:])
-
-    train_ds = GPUResidentDataset(
-        gpu_ds.states[train_idx],
-        gpu_ds.actions[train_idx],
-        gpu_ds.input_dim,
-        gpu_ds.output_dim,
-    )
-    val_ds = GPUResidentDataset(
-        gpu_ds.states[val_idx],
-        gpu_ds.actions[val_idx],
-        gpu_ds.input_dim,
-        gpu_ds.output_dim,
-    )
-    return train_ds, val_ds
+    return result
 
 
 def split_dataset(
@@ -280,7 +230,13 @@ class _IndexedSubset(Dataset):
         current_state = self.dataset.state_arr[frame_idx]
         history_window = self.dataset.history_arr[frame_idx - h:frame_idx][::-1]
         history_flat = history_window.flatten()
-        full_state = np.concatenate([current_state, history_flat])
+
+        parts = [current_state, history_flat]
+
+        if self.dataset.track_features is not None:
+            parts.append(self.dataset.track_features[frame_idx])
+
+        full_state = np.concatenate(parts)
         action = self.dataset.action_arr[frame_idx]
 
         return (

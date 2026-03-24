@@ -4,6 +4,11 @@ trainer/loader.py
 Loads VRS/SRT tab-separated CSV exports and engineers the feature vectors
 used for behavior cloning training.
 
+Enhanced with:
+  - Extended state features (yaw_rate, slip_angle)
+  - Track-aware feature columns for segment context
+  - TrackMap integration for building track maps during preprocessing
+
 VRS CSV format notes (from SRT docs):
   - Tab-separated (not comma)
   - SI units: speed in m/s, distance in meters, angles in radians
@@ -38,11 +43,13 @@ COLUMN_CANDIDATES = {
     "steering":   ["steeringWheelAngle", "steering", "SteeringWheelAngle", "steer"],
     "gear":       ["gear", "Gear", "currentGear"],
     "rpm":        ["rpm", "RPM", "engineRPM"],
-    "lat_g":      ["accelerationY", "lateralAcceleration", "latG", "gLat"],
-    "lon_g":      ["accelerationX", "longitudinalAcceleration", "lonG", "gLon"],
+    "lat_g":      ["accelerationY", "lateralAcceleration", "latG", "gLat", "LatAccel"],
+    "lon_g":      ["accelerationX", "longitudinalAcceleration", "lonG", "gLon", "LongAccel"],
     "track_pos":  ["trackPosition", "track_position", "trackLat", "lanePosition"],
     "lap_dist":   ["lap_distance", "lapDistance", "distanceOnTrack"],
     "lap_time":   ["lap_time", "lapTime", "currentLapTime"],
+    "yaw_rate":   ["YawRate", "yaw_rate", "yawRate"],
+    "velocity_y": ["VelocityY", "velocity_y", "velY", "lateralVelocity"],
 }
 
 SYSTEM_COLS = ["validBin", "lapFlag", "lapIndex", "lapNum", "trackId", "carId",
@@ -116,11 +123,10 @@ def load_vrs_csv(filepath: str) -> Optional[pd.DataFrame]:
     return df
 
 
-def normalize_features(df: pd.DataFrame, cfg: dict) -> tuple:
+def normalize_features(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     """
     Normalize raw telemetry values to [-1, 1] or [0, 1] ranges.
-    Modifies df in-place and returns (df, norm_constants) where
-    norm_constants is a dict of detected normalization values.
+    Modifies df in-place and returns it.
     """
     feat_cfg = cfg.get("features", {})
 
@@ -132,9 +138,8 @@ def normalize_features(df: pd.DataFrame, cfg: dict) -> tuple:
     df["gear"] = df["gear"].clip(0, 7) / 7.0
 
     # RPM: normalize 0-1 using observed max
-    rpm_max = 8000.0
     if "rpm" in df.columns:
-        rpm_max = float(df["rpm"].max())
+        rpm_max = df["rpm"].max()
         if rpm_max > 0:
             df["rpm"] = df["rpm"] / rpm_max
         else:
@@ -151,20 +156,34 @@ def normalize_features(df: pd.DataFrame, cfg: dict) -> tuple:
         steering_lock = float(df["steering"].abs().quantile(0.99))
         if steering_lock < 0.1:
             steering_lock = np.pi  # fallback ~180 degrees
-        logger.debug(f"Auto-detected steering lock: {np.degrees(steering_lock):.1f}°")
+        logger.debug(f"Auto-detected steering lock: {np.degrees(steering_lock):.1f} deg")
 
     df["steering"] = (df["steering"] / steering_lock).clip(-1.0, 1.0)
 
-    # G-forces: normalize using typical racing limits (±4g)
+    # G-forces: normalize using typical racing limits (+/-4g)
     for col in ["lat_g", "lon_g"]:
         if col in df.columns:
-            df[col] = (df[col] / 40.0).clip(-1.0, 1.0)  # 40 m/s² ≈ 4g
+            df[col] = (df[col] / 40.0).clip(-1.0, 1.0)  # 40 m/s^2 ~ 4g
 
     # Track position: should already be -1 to +1, clamp it
     if "track_pos" in df.columns:
         df["track_pos"] = df["track_pos"].clip(-1.0, 1.0)
     else:
         df["track_pos"] = 0.0
+
+    # Yaw rate: normalize to [-1, 1] using +/-3 rad/s range
+    if "yaw_rate" in df.columns:
+        df["yaw_rate"] = (df["yaw_rate"] / 3.0).clip(-1.0, 1.0)
+    else:
+        df["yaw_rate"] = 0.0
+
+    # Lateral velocity -> slip angle proxy
+    if "velocity_y" in df.columns and "speed" in df.columns:
+        safe_speed = df["speed"].clip(lower=1.0)
+        df["slip_angle"] = np.arctan2(df["velocity_y"], safe_speed)
+        df["slip_angle"] = (df["slip_angle"] / 0.5).clip(-1.0, 1.0)
+    else:
+        df["slip_angle"] = 0.0
 
     # Lap distance pct: compute from lap_distance and trackLength
     if "trackLength" in df.columns and "lap_dist" in df.columns:
@@ -173,17 +192,12 @@ def normalize_features(df: pd.DataFrame, cfg: dict) -> tuple:
             df["lap_dist_pct"] = (df["lap_dist"] / track_len).clip(0.0, 1.0)
         else:
             df["lap_dist_pct"] = 0.0
-    else:
+    elif "lap_dist_pct" not in df.columns and "lap_dist" in df.columns:
         # Normalize by observed max distance
         dist_max = df["lap_dist"].max()
         df["lap_dist_pct"] = (df["lap_dist"] / dist_max).clip(0.0, 1.0) if dist_max > 0 else 0.0
 
-    norm_constants = {
-        "steering_lock_radians": float(steering_lock),
-        "rpm_max": float(rpm_max),
-    }
-
-    return df, norm_constants
+    return df
 
 
 def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -204,17 +218,6 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
 
     # Steering rate of change (helps smoothness prediction)
     df["steering_delta"] = df["steering"].diff().fillna(0.0).clip(-0.3, 0.3)
-
-    # Track boundary awareness features
-    if "track_pos" in df.columns:
-        track_pos_abs = df["track_pos"].abs()
-        df["near_edge"] = (track_pos_abs > 0.75).astype(float)
-        df["on_rumble"] = (track_pos_abs > 0.90).astype(float)
-        df["track_pos_sign"] = np.sign(df["track_pos"])
-    else:
-        df["near_edge"] = 0.0
-        df["on_rumble"] = 0.0
-        df["track_pos_sign"] = 0.0
 
     return df
 
@@ -281,7 +284,7 @@ def load_track_car_dataset(
         df = load_vrs_csv(fpath)
         if df is None:
             continue
-        df, _ = normalize_features(df, cfg)
+        df = normalize_features(df, cfg)
         df = engineer_features(df)
 
         # Re-index lapIndex globally across files
@@ -326,13 +329,12 @@ STATE_FEATURES = [
     "rpm",              # engine RPM (0-1)
     "lat_g",            # lateral G-force
     "lon_g",            # longitudinal G-force
-    "track_pos",        # lateral offset from centerline (-1 to +1)
+    "track_pos",        # lateral offset from centerline
     "steering_abs",     # steering magnitude (cornering context)
     "heavy_braking",    # braking zone flag
     "full_throttle",    # full throttle flag
-    "near_edge",        # approaching track edge (|track_pos| > 0.75)
-    "on_rumble",        # on rumble strip / very near edge (|track_pos| > 0.90)
-    "track_pos_sign",   # which side of track (-1=left, 0=center, +1=right)
+    "yaw_rate",         # yaw rotation rate (NEW)
+    "slip_angle",       # estimated slip angle (NEW)
 ]
 
 ACTION_FEATURES = [

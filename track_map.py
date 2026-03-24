@@ -1,673 +1,619 @@
 """
 track_map.py
 
-Builds a virtual track map from recorded telemetry data, enabling track
-boundary awareness for the AI driver.
+GPS-free track positioning system using iRacing telemetry.
 
-iRacing does not directly expose lateral track position in .ibt files, so
-this module reconstructs a centerline profile from available telemetry
-channels (speed, steering, lat_g, lon_g, lap_dist_pct) and derives:
-  - Speed profile with safe min/max envelope
-  - Curvature profile from lateral G / speed^2
-  - Corner detection (apex, direction, entry speed)
-  - Braking zone detection (from sustained heavy braking)
-  - Lateral position estimation from dynamic state comparison
+Since iRacing doesn't expose raw GPS coordinates or lateral track position
+directly in .ibt telemetry, we build a track model from telemetry data:
 
-Usage:
-  # Build from processed data
-  from track_map import TrackMap
-  track_map = TrackMap.build_from_dataframe(df)
-  track_map.save("checkpoints/cadillacctsvr_lagunaseca/track_map.json")
+  1. TrackSegment — divides the track into N segments by lap_dist_pct
+  2. SegmentProfile — stores per-segment statistics learned from training laps:
+     - Reference speed, steering, G-forces (the "racing line")
+     - Track curvature estimate (from steering + speed)
+     - Segment type classification (straight, corner, braking zone, etc.)
+  3. TrackMap — full track model with lookahead for upcoming segments
+  4. LiveTracker — real-time position tracking with segment-aware features
 
-  # Load and query
-  track_map = TrackMap.load("checkpoints/.../track_map.json")
-  corners = track_map.get_corners()
-  braking_zones = track_map.get_braking_zones()
-
-Standalone:
-  python track_map.py --data data/processed/some_combo/data.parquet
+This replaces the need for actual GPS/track maps while giving the model
+spatial context about WHERE on the track it is and WHAT'S COMING NEXT.
 """
 
-import argparse
-import json
 import logging
-from dataclasses import dataclass, field, asdict
+import math
+from dataclasses import dataclass, field
+from enum import Enum, auto
+from typing import List, Optional, Tuple, Dict
 from pathlib import Path
-from typing import List, Optional, Tuple
 
 import numpy as np
+import yaml
 
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Data classes
-# ---------------------------------------------------------------------------
-
-@dataclass
-class Corner:
-    """Detected corner on the track."""
-    start_pct: float       # lap_dist_pct where corner entry begins
-    apex_pct: float        # lap_dist_pct of maximum curvature
-    end_pct: float         # lap_dist_pct where corner exit ends
-    max_curvature: float   # peak curvature value at apex
-    direction: str         # "left" or "right"
-    suggested_entry_speed: float  # observed average speed at corner entry
+class SegmentType(Enum):
+    """Classification of a track segment."""
+    STRAIGHT = auto()
+    BRAKING_ZONE = auto()
+    CORNER_ENTRY = auto()
+    CORNER_APEX = auto()
+    CORNER_EXIT = auto()
+    ACCELERATION_ZONE = auto()
+    CHICANE = auto()
+    UNKNOWN = auto()
 
 
 @dataclass
-class BrakingZone:
-    """Detected braking zone on the track."""
-    start_pct: float       # lap_dist_pct where braking begins
-    end_pct: float         # lap_dist_pct where braking ends
-    entry_speed: float     # average speed at braking zone start
-    exit_speed: float      # average speed at braking zone end
-    brake_intensity: float # average brake pressure in zone (0-1)
+class SegmentProfile:
+    """Statistical profile of a single track segment learned from training data."""
+    segment_id: int = 0
+    pct_start: float = 0.0        # lap_dist_pct start
+    pct_end: float = 0.0          # lap_dist_pct end
+    pct_center: float = 0.0       # center point
 
+    # Reference values (mean of clean laps)
+    ref_speed: float = 0.0        # m/s (raw, not normalized)
+    ref_throttle: float = 0.0     # 0-1
+    ref_brake: float = 0.0        # 0-1
+    ref_steering: float = 0.0     # normalized -1 to 1
+    ref_lat_g: float = 0.0        # m/s^2
+    ref_lon_g: float = 0.0        # m/s^2
 
-@dataclass
-class BinData:
-    """Aggregated telemetry statistics for one track segment."""
-    lap_dist_pct: float = 0.0
-    heading: float = 0.0
-    curvature: float = 0.0
-    typical_speed: float = 0.0
+    # Variability (std dev of clean laps)
     speed_std: float = 0.0
-    speed_min: float = 0.0
-    speed_max: float = 0.0
-    typical_steering: float = 0.0
     steering_std: float = 0.0
-    typical_throttle: float = 0.0
-    typical_brake: float = 0.0
-    typical_lat_g: float = 0.0
-    lat_g_std: float = 0.0
-    typical_lon_g: float = 0.0
-    track_width_estimate: float = 0.0
+
+    # Derived characteristics
+    curvature: float = 0.0        # estimated curvature (higher = tighter corner)
+    segment_type: SegmentType = SegmentType.UNKNOWN
+    is_full_throttle: bool = False
+    is_braking: bool = False
+    is_cornering: bool = False
+
+    # Speed deltas
+    speed_delta: float = 0.0      # speed change across segment (+ = accel, - = decel)
+    min_speed: float = 0.0
+    max_speed: float = 0.0
 
 
-# ---------------------------------------------------------------------------
-# TrackMap
-# ---------------------------------------------------------------------------
+@dataclass
+class TrackMapData:
+    """Serializable track map data for saving/loading."""
+    track_name: str = ""
+    car_name: str = ""
+    combo_name: str = ""
+    num_segments: int = 0
+    track_length_m: float = 0.0
+    segments: List[dict] = field(default_factory=list)
+    personal_best_s: float = 0.0
+    source_laps: int = 0
+    data_hz: int = 60
+
 
 class TrackMap:
     """
-    Represents a learned track layout built from recorded telemetry.
+    Complete track model built from training telemetry.
 
-    The track is divided into N bins by lap_dist_pct. Each bin stores
-    aggregated statistics (speed, curvature, steering, etc.) computed
-    from all observed laps in the training data.
+    Divides the track into N equal segments by lap_dist_pct and stores
+    statistical profiles learned from clean laps. Provides lookahead
+    features for the model to anticipate upcoming corners/braking zones.
     """
 
-    def __init__(self, n_bins: int = 200):
-        self.n_bins: int = n_bins
-        self.bins: List[BinData] = [BinData() for _ in range(n_bins)]
-        self._corners: Optional[List[Corner]] = None
-        self._braking_zones: Optional[List[BrakingZone]] = None
+    DEFAULT_NUM_SEGMENTS = 100  # 1% of track per segment
 
-    # ------------------------------------------------------------------
-    # Build from telemetry
-    # ------------------------------------------------------------------
+    def __init__(self, num_segments: int = DEFAULT_NUM_SEGMENTS):
+        self.num_segments = num_segments
+        self.segments: List[SegmentProfile] = []
+        self.track_name: str = ""
+        self.car_name: str = ""
+        self.combo_name: str = ""
+        self.track_length_m: float = 0.0
+        self.personal_best_s: float = 0.0
+        self._built = False
 
-    @classmethod
-    def build_from_dataframe(
-        cls,
-        df,
-        n_bins: int = 200,
-    ) -> "TrackMap":
+    def build_from_dataframe(self, df, combo_name: str = "", track_length_m: float = 0.0):
         """
-        Build a TrackMap from a processed telemetry DataFrame.
+        Build track map from a preprocessed training DataFrame.
 
-        Parameters
-        ----------
-        df : pandas.DataFrame
-            Must contain columns: lap_dist_pct, speed, steering, lat_g, lon_g,
-            throttle, brake.  Additional columns (gear, rpm, etc.) are ignored.
-        n_bins : int
-            Number of equal-width segments to divide the track into.
-            Default 200 gives ~0.5 % resolution.
-
-        Returns
-        -------
-        TrackMap
-            Populated track map ready for queries.
+        The DataFrame should contain raw (un-normalized) telemetry with columns:
+            speed, throttle, brake, steering, lat_g, lon_g, lap_dist_pct, lapIndex
         """
-        import pandas as pd  # deferred so numpy-only callers don't need pandas
+        self.combo_name = combo_name
+        self.track_length_m = track_length_m
 
-        required = {"lap_dist_pct", "speed", "steering", "lat_g", "lon_g",
-                     "throttle", "brake"}
-        missing = required - set(df.columns)
-        if missing:
-            raise ValueError(f"DataFrame is missing required columns: {missing}")
+        if "lap_dist_pct" not in df.columns:
+            logger.warning("Cannot build track map: missing lap_dist_pct")
+            return
 
-        tm = cls(n_bins=n_bins)
+        n = self.num_segments
+        segment_width = 1.0 / n
+        self.segments = []
 
-        # Bin edges from 0 to 1
-        bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
-        bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+        for i in range(n):
+            pct_start = i * segment_width
+            pct_end = (i + 1) * segment_width
+            pct_center = (pct_start + pct_end) / 2.0
 
-        # Assign each row to a bin
-        pct = df["lap_dist_pct"].values
-        bin_idx = np.clip(
-            np.digitize(pct, bin_edges[1:]),  # 0-based bin index
-            0,
-            n_bins - 1,
-        )
+            # Select rows in this segment
+            mask = (df["lap_dist_pct"] >= pct_start) & (df["lap_dist_pct"] < pct_end)
+            seg_df = df[mask]
 
-        speed = df["speed"].values.astype(np.float64)
-        steering = df["steering"].values.astype(np.float64)
-        lat_g = df["lat_g"].values.astype(np.float64)
-        lon_g = df["lon_g"].values.astype(np.float64)
-        throttle = df["throttle"].values.astype(np.float64)
-        brake = df["brake"].values.astype(np.float64)
+            seg = SegmentProfile(
+                segment_id=i,
+                pct_start=pct_start,
+                pct_end=pct_end,
+                pct_center=pct_center,
+            )
 
-        eps = 1e-6  # avoid division by zero
+            if len(seg_df) > 0:
+                seg.ref_speed = float(seg_df["speed"].mean()) if "speed" in seg_df else 0.0
+                seg.ref_throttle = float(seg_df["throttle"].mean()) if "throttle" in seg_df else 0.0
+                seg.ref_brake = float(seg_df["brake"].mean()) if "brake" in seg_df else 0.0
+                seg.ref_steering = float(seg_df["steering"].mean()) if "steering" in seg_df else 0.0
+                seg.ref_lat_g = float(seg_df["lat_g"].mean()) if "lat_g" in seg_df else 0.0
+                seg.ref_lon_g = float(seg_df["lon_g"].mean()) if "lon_g" in seg_df else 0.0
 
-        for i in range(n_bins):
-            mask = bin_idx == i
-            if not np.any(mask):
-                # Empty bin — interpolate later
-                tm.bins[i].lap_dist_pct = float(bin_centers[i])
-                continue
+                seg.speed_std = float(seg_df["speed"].std()) if "speed" in seg_df else 0.0
+                seg.steering_std = float(seg_df["steering"].std()) if "steering" in seg_df else 0.0
 
-            s = speed[mask]
-            st = steering[mask]
-            lg = lat_g[mask]
-            lng = lon_g[mask]
-            thr = throttle[mask]
-            brk = brake[mask]
+                seg.min_speed = float(seg_df["speed"].min()) if "speed" in seg_df else 0.0
+                seg.max_speed = float(seg_df["speed"].max()) if "speed" in seg_df else 0.0
 
-            bd = tm.bins[i]
-            bd.lap_dist_pct = float(bin_centers[i])
+                # Estimate curvature from steering angle and speed
+                # curvature ≈ |steering| / speed (simplified bicycle model)
+                if seg.ref_speed > 5.0:
+                    seg.curvature = abs(seg.ref_steering) / seg.ref_speed * 50.0
+                else:
+                    seg.curvature = abs(seg.ref_steering) * 10.0
 
-            # Speed statistics
-            bd.typical_speed = float(np.mean(s))
-            bd.speed_std = float(np.std(s))
-            bd.speed_min = float(np.min(s))
-            bd.speed_max = float(np.max(s))
+            self.segments.append(seg)
 
-            # Steering
-            bd.typical_steering = float(np.mean(st))
-            bd.steering_std = float(np.std(st))
+        # Compute speed deltas between segments
+        for i in range(n):
+            next_i = (i + 1) % n
+            self.segments[i].speed_delta = (
+                self.segments[next_i].ref_speed - self.segments[i].ref_speed
+            )
 
-            # Lateral / longitudinal G
-            bd.typical_lat_g = float(np.mean(lg))
-            bd.lat_g_std = float(np.std(lg))
-            bd.typical_lon_g = float(np.mean(lng))
+        # Classify segment types
+        self._classify_segments()
+        self._built = True
 
-            # Curvature: lat_g / speed^2  (positive = left, negative = right)
-            speed_sq = s ** 2 + eps
-            curvatures = lg / speed_sq
-            bd.curvature = float(np.mean(curvatures))
-
-            # Heading: integrate curvature as a rough proxy.
-            # We reconstruct relative heading changes from lat_g / speed.
-            # heading_rate = lat_g / speed  (rad/s, but we bin by distance)
-            heading_rates = lg / (s + eps)
-            bd.heading = float(np.mean(heading_rates))
-
-            # Controls
-            bd.typical_throttle = float(np.mean(thr))
-            bd.typical_brake = float(np.mean(brk))
-
-            # Track width estimate: higher variance in lateral G indicates a
-            # wider section where drivers take different lines.
-            bd.track_width_estimate = float(np.std(lg)) + float(np.std(st)) * 0.5
-
-        # Fill any empty bins by linear interpolation from neighbors
-        tm._interpolate_empty_bins()
-
-        # Pre-compute derived structures
-        tm._corners = None
-        tm._braking_zones = None
-
+        n_corners = sum(1 for s in self.segments if s.is_cornering)
+        n_straights = sum(1 for s in self.segments if s.segment_type == SegmentType.STRAIGHT)
+        n_braking = sum(1 for s in self.segments if s.is_braking)
         logger.info(
-            f"TrackMap built: {n_bins} bins, "
-            f"{len(tm.get_corners())} corners, "
-            f"{len(tm.get_braking_zones())} braking zones"
+            f"Track map built: {n} segments, "
+            f"{n_corners} corners, {n_straights} straights, {n_braking} braking zones"
         )
-        return tm
 
-    def _interpolate_empty_bins(self) -> None:
-        """Fill bins that had no data via linear interpolation."""
-        fields = [
-            "heading", "curvature", "typical_speed", "speed_std",
-            "speed_min", "speed_max", "typical_steering", "steering_std",
-            "typical_throttle", "typical_brake", "typical_lat_g",
-            "lat_g_std", "typical_lon_g", "track_width_estimate",
+    def _classify_segments(self):
+        """Classify each segment based on its telemetry profile."""
+        for seg in self.segments:
+            # Thresholds for classification
+            steering_threshold = 0.05   # normalized, above this = cornering
+            brake_threshold = 0.15      # above this = braking zone
+            throttle_threshold = 0.85   # above this = full throttle
+            curvature_threshold = 0.3   # above this = significant corner
+
+            seg.is_full_throttle = seg.ref_throttle > throttle_threshold
+            seg.is_braking = seg.ref_brake > brake_threshold
+            seg.is_cornering = abs(seg.ref_steering) > steering_threshold
+
+            if seg.is_braking and seg.speed_delta < -1.0:
+                seg.segment_type = SegmentType.BRAKING_ZONE
+            elif seg.is_cornering and seg.curvature > curvature_threshold:
+                if seg.speed_delta < -0.5:
+                    seg.segment_type = SegmentType.CORNER_ENTRY
+                elif seg.speed_delta > 0.5:
+                    seg.segment_type = SegmentType.CORNER_EXIT
+                else:
+                    seg.segment_type = SegmentType.CORNER_APEX
+            elif seg.is_full_throttle and not seg.is_cornering:
+                if seg.speed_delta > 0.5:
+                    seg.segment_type = SegmentType.ACCELERATION_ZONE
+                else:
+                    seg.segment_type = SegmentType.STRAIGHT
+            elif seg.is_cornering and abs(seg.ref_steering) < 0.15:
+                seg.segment_type = SegmentType.CHICANE
+            else:
+                seg.segment_type = SegmentType.UNKNOWN
+
+    # ------------------------------------------------------------------
+    # Lookup and features
+    # ------------------------------------------------------------------
+
+    def get_segment(self, lap_dist_pct: float) -> Optional[SegmentProfile]:
+        """Get the segment profile for a given track position."""
+        if not self._built or not self.segments:
+            return None
+        idx = int(lap_dist_pct * self.num_segments) % self.num_segments
+        return self.segments[idx]
+
+    def get_segment_index(self, lap_dist_pct: float) -> int:
+        """Get segment index for a given track position."""
+        return int(lap_dist_pct * self.num_segments) % self.num_segments
+
+    def get_lookahead(
+        self, lap_dist_pct: float, num_ahead: int = 5
+    ) -> List[SegmentProfile]:
+        """
+        Get profiles for upcoming segments (lookahead).
+
+        This gives the model advance knowledge of what's coming:
+        braking zones, corners, straights.
+        """
+        if not self._built:
+            return []
+
+        current_idx = self.get_segment_index(lap_dist_pct)
+        ahead = []
+        for i in range(1, num_ahead + 1):
+            idx = (current_idx + i) % self.num_segments
+            ahead.append(self.segments[idx])
+        return ahead
+
+    def get_lookbehind(
+        self, lap_dist_pct: float, num_behind: int = 2
+    ) -> List[SegmentProfile]:
+        """Get profiles for recently passed segments."""
+        if not self._built:
+            return []
+
+        current_idx = self.get_segment_index(lap_dist_pct)
+        behind = []
+        for i in range(1, num_behind + 1):
+            idx = (current_idx - i) % self.num_segments
+            behind.append(self.segments[idx])
+        return behind
+
+    def get_track_features(
+        self,
+        lap_dist_pct: float,
+        current_speed: float = 0.0,
+        lookahead: int = 5,
+    ) -> np.ndarray:
+        """
+        Build a track-aware feature vector for the current position.
+
+        Returns numpy array with:
+          [0]     curvature of current segment (0 = straight, higher = tighter)
+          [1]     segment type one-hot: is_straight
+          [2]     segment type one-hot: is_braking_zone
+          [3]     segment type one-hot: is_corner
+          [4]     segment type one-hot: is_acceleration
+          [5]     reference speed delta (how fast should we be vs how fast are we)
+          [6]     reference steering magnitude
+          [7]     distance to next braking zone (0-1 normalized)
+          [8]     distance to next corner (0-1 normalized)
+          [9..9+lookahead*3]  lookahead: [curvature, ref_speed_norm, ref_brake] per segment
+        """
+        if not self._built:
+            return np.zeros(10 + lookahead * 3, dtype=np.float32)
+
+        seg = self.get_segment(lap_dist_pct)
+
+        # Current segment features
+        curvature = min(seg.curvature / 5.0, 1.0)  # normalize to 0-1
+        is_straight = float(seg.segment_type == SegmentType.STRAIGHT)
+        is_braking = float(seg.segment_type == SegmentType.BRAKING_ZONE)
+        is_corner = float(seg.is_cornering)
+        is_accel = float(seg.segment_type == SegmentType.ACCELERATION_ZONE)
+
+        # Speed reference delta (positive = we should be going faster)
+        speed_max = max(s.max_speed for s in self.segments) if self.segments else 1.0
+        speed_delta_ref = 0.0
+        if speed_max > 0 and seg.ref_speed > 0:
+            speed_delta_ref = (seg.ref_speed - current_speed) / speed_max
+
+        steer_ref = min(abs(seg.ref_steering), 1.0)
+
+        # Distance to next key features
+        dist_to_brake = self._distance_to_type(lap_dist_pct, SegmentType.BRAKING_ZONE)
+        dist_to_corner = self._distance_to_corner(lap_dist_pct)
+
+        features = [
+            curvature,
+            is_straight,
+            is_braking,
+            is_corner,
+            is_accel,
+            np.clip(speed_delta_ref, -1.0, 1.0),
+            steer_ref,
+            dist_to_brake,
+            dist_to_corner,
         ]
-        n = self.n_bins
-        for fname in fields:
-            vals = np.array([getattr(self.bins[i], fname) for i in range(n)])
-            populated = np.array([
-                i for i in range(n) if vals[i] != 0.0 or fname == "curvature"
-            ])
-            if len(populated) < 2:
-                continue
 
-            # Only interpolate truly empty bins (speed == 0 means no data)
-            empty_mask = np.array([
-                self.bins[i].typical_speed == 0.0 and self.bins[i].lap_dist_pct != 0.0
-                for i in range(n)
-            ])
-            if not np.any(empty_mask):
-                continue
+        # Lookahead features
+        ahead_segs = self.get_lookahead(lap_dist_pct, lookahead)
+        for seg_ahead in ahead_segs:
+            features.append(min(seg_ahead.curvature / 5.0, 1.0))
+            features.append(seg_ahead.ref_speed / speed_max if speed_max > 0 else 0.0)
+            features.append(min(seg_ahead.ref_brake, 1.0))
 
-            populated_vals = vals[populated]
-            populated_pcts = np.array([
-                self.bins[i].lap_dist_pct for i in populated
-            ])
-            all_pcts = np.array([self.bins[i].lap_dist_pct for i in range(n)])
+        # Pad if we don't have enough lookahead
+        while len(features) < 9 + lookahead * 3:
+            features.append(0.0)
 
-            interp_vals = np.interp(all_pcts, populated_pcts, populated_vals)
-            for i in range(n):
-                if empty_mask[i]:
-                    setattr(self.bins[i], fname, float(interp_vals[i]))
+        return np.array(features, dtype=np.float32)
 
-    # ------------------------------------------------------------------
-    # Speed profile
-    # ------------------------------------------------------------------
-
-    def get_speed_profile(self) -> np.ndarray:
+    def get_boundary_proximity(self, lap_dist_pct: float, track_pos: float) -> float:
         """
-        Return the speed profile as an array of shape (n_bins, 4).
+        Estimate how close the car is to the track boundary.
 
-        Columns: [lap_dist_pct, safe_min_speed, typical_speed, safe_max_speed]
+        Returns 0.0 (center) to 1.0 (at edge).
 
-        safe_min = mean - 2*std (clipped to 0)
-        safe_max = mean + 2*std
+        Since iRacing doesn't give us lateral position directly, we estimate
+        from steering deviation and G-force deviation from the reference line.
         """
-        result = np.zeros((self.n_bins, 4), dtype=np.float64)
-        for i, b in enumerate(self.bins):
-            safe_min = max(0.0, b.typical_speed - 2.0 * b.speed_std)
-            safe_max = b.typical_speed + 2.0 * b.speed_std
-            result[i] = [b.lap_dist_pct, safe_min, b.typical_speed, safe_max]
-        return result
+        seg = self.get_segment(lap_dist_pct)
+        if seg is None:
+            return 0.0
+
+        # Use track_pos if available (non-zero)
+        if abs(track_pos) > 0.01:
+            return min(abs(track_pos), 1.0)
+
+        # Fallback: no boundary info available
+        return 0.0
+
+    def _distance_to_type(self, lap_dist_pct: float, seg_type: SegmentType) -> float:
+        """Distance (in pct, 0-1) to the next segment of given type."""
+        idx = self.get_segment_index(lap_dist_pct)
+        for i in range(1, self.num_segments):
+            check_idx = (idx + i) % self.num_segments
+            if self.segments[check_idx].segment_type == seg_type:
+                return i / self.num_segments
+        return 1.0  # not found = far away
+
+    def _distance_to_corner(self, lap_dist_pct: float) -> float:
+        """Distance (in pct, 0-1) to the next cornering segment."""
+        idx = self.get_segment_index(lap_dist_pct)
+        for i in range(1, self.num_segments):
+            check_idx = (idx + i) % self.num_segments
+            if self.segments[check_idx].is_cornering:
+                return i / self.num_segments
+        return 1.0
 
     # ------------------------------------------------------------------
-    # Curvature profile
+    # Persistence
     # ------------------------------------------------------------------
 
-    def get_curvature_profile(self) -> np.ndarray:
-        """
-        Return the curvature profile as an array of shape (n_bins, 2).
+    def save(self, filepath: str):
+        """Save track map to YAML file."""
+        data = {
+            "track_name": self.track_name,
+            "car_name": self.car_name,
+            "combo_name": self.combo_name,
+            "track_length_m": self.track_length_m,
+            "num_segments": self.num_segments,
+            "personal_best_s": self.personal_best_s,
+            "segments": [],
+        }
 
-        Columns: [lap_dist_pct, curvature]
+        for seg in self.segments:
+            data["segments"].append({
+                "id": seg.segment_id,
+                "pct_start": round(seg.pct_start, 6),
+                "pct_end": round(seg.pct_end, 6),
+                "ref_speed": round(seg.ref_speed, 3),
+                "ref_throttle": round(seg.ref_throttle, 4),
+                "ref_brake": round(seg.ref_brake, 4),
+                "ref_steering": round(seg.ref_steering, 4),
+                "ref_lat_g": round(seg.ref_lat_g, 3),
+                "ref_lon_g": round(seg.ref_lon_g, 3),
+                "curvature": round(seg.curvature, 4),
+                "segment_type": seg.segment_type.name,
+                "min_speed": round(seg.min_speed, 3),
+                "max_speed": round(seg.max_speed, 3),
+                "speed_delta": round(seg.speed_delta, 3),
+            })
 
-        High absolute curvature = sharp corner = need to slow down.
-        Positive curvature = left turn, negative = right turn.
-        """
-        result = np.zeros((self.n_bins, 2), dtype=np.float64)
-        for i, b in enumerate(self.bins):
-            result[i] = [b.lap_dist_pct, b.curvature]
-        return result
+        Path(filepath).parent.mkdir(parents=True, exist_ok=True)
+        with open(filepath, "w") as f:
+            yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+        logger.info(f"Track map saved to {filepath}")
 
-    # ------------------------------------------------------------------
-    # Corner detection
-    # ------------------------------------------------------------------
+    def load(self, filepath: str) -> bool:
+        """Load track map from YAML file. Returns True if successful."""
+        try:
+            with open(filepath) as f:
+                data = yaml.safe_load(f)
 
-    def get_corners(self, min_curvature: float = 0.005) -> List[Corner]:
-        """
-        Detect corners from the curvature profile.
+            self.track_name = data.get("track_name", "")
+            self.car_name = data.get("car_name", "")
+            self.combo_name = data.get("combo_name", "")
+            self.track_length_m = data.get("track_length_m", 0.0)
+            self.num_segments = data.get("num_segments", self.DEFAULT_NUM_SEGMENTS)
+            self.personal_best_s = data.get("personal_best_s", 0.0)
 
-        Parameters
-        ----------
-        min_curvature : float
-            Minimum absolute curvature to qualify as a corner.
+            self.segments = []
+            type_map = {t.name: t for t in SegmentType}
 
-        Returns
-        -------
-        list of Corner
-            Sorted by start_pct.
-        """
-        if self._corners is not None:
-            return self._corners
+            for seg_data in data.get("segments", []):
+                seg = SegmentProfile(
+                    segment_id=seg_data["id"],
+                    pct_start=seg_data["pct_start"],
+                    pct_end=seg_data["pct_end"],
+                    pct_center=(seg_data["pct_start"] + seg_data["pct_end"]) / 2.0,
+                    ref_speed=seg_data.get("ref_speed", 0),
+                    ref_throttle=seg_data.get("ref_throttle", 0),
+                    ref_brake=seg_data.get("ref_brake", 0),
+                    ref_steering=seg_data.get("ref_steering", 0),
+                    ref_lat_g=seg_data.get("ref_lat_g", 0),
+                    ref_lon_g=seg_data.get("ref_lon_g", 0),
+                    curvature=seg_data.get("curvature", 0),
+                    segment_type=type_map.get(seg_data.get("segment_type", "UNKNOWN"),
+                                              SegmentType.UNKNOWN),
+                    min_speed=seg_data.get("min_speed", 0),
+                    max_speed=seg_data.get("max_speed", 0),
+                    speed_delta=seg_data.get("speed_delta", 0),
+                )
+                seg.is_cornering = abs(seg.ref_steering) > 0.05
+                seg.is_braking = seg.ref_brake > 0.15
+                seg.is_full_throttle = seg.ref_throttle > 0.85
+                self.segments.append(seg)
 
-        curvatures = np.array([b.curvature for b in self.bins])
-        abs_curv = np.abs(curvatures)
+            self._built = len(self.segments) > 0
+            logger.info(f"Track map loaded: {filepath} ({len(self.segments)} segments)")
+            return True
 
-        # Identify bins above the curvature threshold
-        above = abs_curv >= min_curvature
+        except Exception as e:
+            logger.warning(f"Failed to load track map from {filepath}: {e}")
+            return False
 
-        corners: List[Corner] = []
-        i = 0
-        n = self.n_bins
-        while i < n:
-            if not above[i]:
-                i += 1
-                continue
+    @property
+    def is_built(self) -> bool:
+        return self._built
 
-            # Found start of a corner region
-            start = i
-            while i < n and above[i]:
-                i += 1
-            end = i - 1  # inclusive
 
-            # Find apex: bin with max absolute curvature in this region
-            region_abs = abs_curv[start:end + 1]
-            apex_offset = int(np.argmax(region_abs))
-            apex = start + apex_offset
+class LiveTracker:
+    """
+    Real-time track position tracker that provides rich spatial context
+    during live racing.
 
-            max_curv = float(abs_curv[apex])
-            direction = "left" if curvatures[apex] > 0 else "right"
+    Wraps a TrackMap and maintains state about current position, upcoming
+    features, and deviations from the reference racing line.
+    """
 
-            # Suggested entry speed: average observed speed at corner start
-            suggested_entry_speed = float(self.bins[start].typical_speed)
+    def __init__(self, track_map: TrackMap, lookahead: int = 5):
+        self.track_map = track_map
+        self.lookahead = lookahead
 
-            corners.append(Corner(
-                start_pct=float(self.bins[start].lap_dist_pct),
-                apex_pct=float(self.bins[apex].lap_dist_pct),
-                end_pct=float(self.bins[end].lap_dist_pct),
-                max_curvature=max_curv,
-                direction=direction,
-                suggested_entry_speed=suggested_entry_speed,
-            ))
+        # Position tracking
+        self._prev_pct = 0.0
+        self._lap_count = 0
+        self._lap_start_time = 0.0
+        self._lap_times: List[float] = []
 
-        self._corners = corners
-        return corners
+        # Deviation tracking (rolling window)
+        self._speed_deviations = np.zeros(60, dtype=np.float32)
+        self._steer_deviations = np.zeros(60, dtype=np.float32)
+        self._dev_ptr = 0
 
-    # ------------------------------------------------------------------
-    # Braking zone detection
-    # ------------------------------------------------------------------
-
-    def get_braking_zones(self, min_brake: float = 0.15, min_bins: int = 2) -> List[BrakingZone]:
-        """
-        Detect braking zones from the telemetry profile.
-
-        A braking zone is a contiguous region where the typical brake
-        pressure exceeds ``min_brake`` for at least ``min_bins`` segments.
-
-        Parameters
-        ----------
-        min_brake : float
-            Minimum typical brake value to consider as active braking.
-        min_bins : int
-            Minimum number of consecutive bins to qualify as a braking zone.
-
-        Returns
-        -------
-        list of BrakingZone
-            Sorted by start_pct.
-        """
-        if self._braking_zones is not None:
-            return self._braking_zones
-
-        brakes = np.array([b.typical_brake for b in self.bins])
-        above = brakes >= min_brake
-
-        zones: List[BrakingZone] = []
-        i = 0
-        n = self.n_bins
-        while i < n:
-            if not above[i]:
-                i += 1
-                continue
-
-            start = i
-            while i < n and above[i]:
-                i += 1
-            end = i - 1  # inclusive
-
-            if (end - start + 1) < min_bins:
-                continue
-
-            entry_speed = float(self.bins[start].typical_speed)
-            exit_speed = float(self.bins[end].typical_speed)
-            avg_brake = float(np.mean(brakes[start:end + 1]))
-
-            zones.append(BrakingZone(
-                start_pct=float(self.bins[start].lap_dist_pct),
-                end_pct=float(self.bins[end].lap_dist_pct),
-                entry_speed=entry_speed,
-                exit_speed=exit_speed,
-                brake_intensity=avg_brake,
-            ))
-
-        self._braking_zones = zones
-        return zones
-
-    # ------------------------------------------------------------------
-    # Track position estimation
-    # ------------------------------------------------------------------
-
-    def estimate_track_pos(
+    def update(
         self,
         lap_dist_pct: float,
         speed: float,
         steering: float,
-        lat_g: float,
-    ) -> float:
+        track_pos: float = 0.0,
+    ) -> dict:
         """
-        Estimate lateral track position from the current dynamic state.
+        Update tracker with current telemetry and return rich context.
 
-        Compares the current steering and lateral G against the typical
-        values at this track position to infer a lateral offset.
-
-        Parameters
-        ----------
-        lap_dist_pct : float
-            Current position on track (0 to 1).
-        speed : float
-            Current speed (same units/normalization as training data).
-        steering : float
-            Current steering input (normalized -1 to 1).
-        lat_g : float
-            Current lateral acceleration (normalized).
-
-        Returns
-        -------
-        float
-            Estimated lateral position in [-1, 1].
-            0 = on the typical racing line,
-            negative = inside / left of line,
-            positive = outside / right of line.
+        Returns dict with:
+            segment_id:       current segment index
+            segment_type:     SegmentType enum
+            track_features:   numpy array for model input
+            boundary_pct:     proximity to track edge (0-1)
+            speed_deviation:  how far from reference speed
+            upcoming_corner:  distance to next corner (0-1)
+            upcoming_brake:   distance to next braking zone (0-1)
+            lap_crossed:      True if we just crossed start/finish
         """
-        b = self._get_bin(lap_dist_pct)
+        # Detect lap crossing
+        lap_crossed = False
+        if self._prev_pct > 0.95 and lap_dist_pct < 0.05:
+            lap_crossed = True
+            self._lap_count += 1
+            now = time.perf_counter()
+            if self._lap_start_time > 0:
+                lap_time = now - self._lap_start_time
+                self._lap_times.append(lap_time)
+            self._lap_start_time = now
 
-        # Steering deviation: how much are we steering differently from normal?
+        self._prev_pct = lap_dist_pct
+
+        if not self.track_map.is_built:
+            return {
+                "segment_id": 0,
+                "segment_type": SegmentType.UNKNOWN,
+                "track_features": np.zeros(9 + self.lookahead * 3, dtype=np.float32),
+                "boundary_pct": 0.0,
+                "speed_deviation": 0.0,
+                "upcoming_corner": 1.0,
+                "upcoming_brake": 1.0,
+                "lap_crossed": lap_crossed,
+            }
+
+        seg = self.track_map.get_segment(lap_dist_pct)
+
+        # Track features for model input
+        track_features = self.track_map.get_track_features(
+            lap_dist_pct, speed, self.lookahead
+        )
+
+        # Boundary proximity
+        boundary_pct = self.track_map.get_boundary_proximity(lap_dist_pct, track_pos)
+
+        # Speed deviation from reference
+        speed_dev = 0.0
+        if seg and seg.ref_speed > 0:
+            speed_dev = (speed - seg.ref_speed) / seg.ref_speed
+
+        # Steering deviation from reference
         steer_dev = 0.0
-        if b.steering_std > 1e-6:
-            steer_dev = (steering - b.typical_steering) / b.steering_std
-        else:
-            steer_dev = steering - b.typical_steering
+        if seg:
+            steer_dev = steering - seg.ref_steering
 
-        # Lateral G deviation: compare current lat_g to expected
-        eps = 1e-6
-        expected_lat_g = b.curvature * (speed ** 2 + eps)
-        lat_g_dev = 0.0
-        if b.lat_g_std > 1e-6:
-            lat_g_dev = (lat_g - b.typical_lat_g) / b.lat_g_std
-        else:
-            lat_g_dev = lat_g - b.typical_lat_g
+        # Update deviation history
+        ptr = self._dev_ptr % len(self._speed_deviations)
+        self._speed_deviations[ptr] = speed_dev
+        self._steer_deviations[ptr] = steer_dev
+        self._dev_ptr += 1
 
-        # Combine: weighted sum of deviations, clipped to [-1, 1]
-        # Steering deviation is the stronger signal for lateral offset
-        track_pos = np.clip(0.6 * steer_dev + 0.4 * lat_g_dev, -1.0, 1.0)
-        # Normalize: divide by ~3 std to keep output in a useful range
-        track_pos = np.clip(track_pos / 3.0, -1.0, 1.0)
+        # Upcoming features
+        upcoming_corner = self.track_map._distance_to_corner(lap_dist_pct)
+        upcoming_brake = self.track_map._distance_to_type(
+            lap_dist_pct, SegmentType.BRAKING_ZONE
+        )
 
-        return float(track_pos)
-
-    def _get_bin(self, lap_dist_pct: float) -> BinData:
-        """Return the BinData for the segment containing ``lap_dist_pct``."""
-        idx = int(lap_dist_pct * self.n_bins)
-        idx = max(0, min(idx, self.n_bins - 1))
-        return self.bins[idx]
-
-    # ------------------------------------------------------------------
-    # Lookup helpers
-    # ------------------------------------------------------------------
-
-    def get_typical_speed_at(self, lap_dist_pct: float) -> float:
-        """Return typical speed at a given track position."""
-        return self._get_bin(lap_dist_pct).typical_speed
-
-    def get_curvature_at(self, lap_dist_pct: float) -> float:
-        """Return curvature at a given track position."""
-        return self._get_bin(lap_dist_pct).curvature
-
-    def get_speed_range_at(self, lap_dist_pct: float) -> Tuple[float, float]:
-        """Return (min, max) observed speed at a given track position."""
-        b = self._get_bin(lap_dist_pct)
-        return (b.speed_min, b.speed_max)
-
-    # ------------------------------------------------------------------
-    # Save / Load
-    # ------------------------------------------------------------------
-
-    def save(self, path: str) -> None:
-        """
-        Save the track map to a JSON file.
-
-        Parameters
-        ----------
-        path : str or Path
-            Output file path (typically ``track_map.json``).
-        """
-        p = Path(path)
-        p.parent.mkdir(parents=True, exist_ok=True)
-
-        data = {
-            "n_bins": self.n_bins,
-            "bins": [asdict(b) for b in self.bins],
+        return {
+            "segment_id": seg.segment_id if seg else 0,
+            "segment_type": seg.segment_type if seg else SegmentType.UNKNOWN,
+            "track_features": track_features,
+            "boundary_pct": boundary_pct,
+            "speed_deviation": np.clip(speed_dev, -1.0, 1.0),
+            "upcoming_corner": upcoming_corner,
+            "upcoming_brake": upcoming_brake,
+            "lap_crossed": lap_crossed,
         }
 
-        with open(p, "w") as f:
-            json.dump(data, f, indent=2)
+    @property
+    def lap_count(self) -> int:
+        return self._lap_count
 
-        logger.info(f"TrackMap saved to {p}")
+    @property
+    def best_lap_time(self) -> float:
+        return min(self._lap_times) if self._lap_times else 0.0
 
-    @classmethod
-    def load(cls, path: str) -> "TrackMap":
-        """
-        Load a track map from a JSON file.
-
-        Parameters
-        ----------
-        path : str or Path
-            Path to a ``track_map.json`` file.
-
-        Returns
-        -------
-        TrackMap
-        """
-        with open(path) as f:
-            data = json.load(f)
-
-        n_bins = data["n_bins"]
-        tm = cls(n_bins=n_bins)
-
-        for i, bd_dict in enumerate(data["bins"]):
-            tm.bins[i] = BinData(**bd_dict)
-
-        logger.info(f"TrackMap loaded from {path}: {n_bins} bins")
-        return tm
-
-    # ------------------------------------------------------------------
-    # Display helpers
-    # ------------------------------------------------------------------
-
-    def summary(self) -> str:
-        """Return a human-readable summary of the track map."""
-        corners = self.get_corners()
-        braking = self.get_braking_zones()
-        sp = self.get_speed_profile()
-
-        lines = [
-            f"TrackMap: {self.n_bins} bins",
-            f"  Speed range : {sp[:, 1].min():.3f} – {sp[:, 3].max():.3f}",
-            f"  Avg speed   : {sp[:, 2].mean():.3f}",
-            f"  Corners     : {len(corners)}",
-            f"  Braking zones: {len(braking)}",
-        ]
-
-        if corners:
-            lines.append("")
-            lines.append("  Corners:")
-            for i, c in enumerate(corners):
-                lines.append(
-                    f"    {i + 1:2d}. {c.direction:5s}  "
-                    f"pct={c.start_pct:.3f}→{c.apex_pct:.3f}→{c.end_pct:.3f}  "
-                    f"curv={c.max_curvature:.4f}  "
-                    f"entry_spd={c.suggested_entry_speed:.3f}"
-                )
-
-        if braking:
-            lines.append("")
-            lines.append("  Braking zones:")
-            for i, bz in enumerate(braking):
-                lines.append(
-                    f"    {i + 1:2d}. pct={bz.start_pct:.3f}→{bz.end_pct:.3f}  "
-                    f"spd={bz.entry_speed:.3f}→{bz.exit_speed:.3f}  "
-                    f"brake={bz.brake_intensity:.2f}"
-                )
-
-        return "\n".join(lines)
+    @property
+    def avg_speed_deviation(self) -> float:
+        """Average speed deviation over recent window (+ = faster than ref)."""
+        if self._dev_ptr == 0:
+            return 0.0
+        n = min(self._dev_ptr, len(self._speed_deviations))
+        return float(np.mean(self._speed_deviations[:n]))
 
 
-# ---------------------------------------------------------------------------
-# Standalone entry point
-# ---------------------------------------------------------------------------
+def build_track_map_from_parquet(
+    parquet_path: str,
+    combo_name: str = "",
+    num_segments: int = 100,
+    track_length_m: float = 0.0,
+) -> TrackMap:
+    """
+    Convenience function: build a TrackMap from a preprocessed parquet file.
 
-def main():
-    """Build a track map from a parquet file and print diagnostics."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%H:%M:%S",
-    )
-
-    parser = argparse.ArgumentParser(
-        description="Build a track map from processed telemetry data."
-    )
-    parser.add_argument(
-        "--data", required=True,
-        help="Path to a processed data.parquet file.",
-    )
-    parser.add_argument(
-        "--bins", type=int, default=200,
-        help="Number of track segments (default: 200).",
-    )
-    parser.add_argument(
-        "--output", default=None,
-        help="Output path for track_map.json (default: same dir as data).",
-    )
-    args = parser.parse_args()
-
+    This reads the raw (un-normalized) data if available, or works with
+    normalized data and un-normalizes using metadata.
+    """
     import pandas as pd
 
-    data_path = Path(args.data)
-    if not data_path.exists():
-        logger.error(f"Data file not found: {data_path}")
-        return
+    df = pd.read_parquet(parquet_path)
+    logger.info(f"Building track map from {parquet_path} ({len(df)} frames)")
 
-    logger.info(f"Loading {data_path} ...")
-    df = pd.read_parquet(data_path)
-    logger.info(f"  {len(df):,} rows, columns: {list(df.columns)}")
+    track_map = TrackMap(num_segments=num_segments)
+    track_map.build_from_dataframe(df, combo_name, track_length_m)
 
-    tm = TrackMap.build_from_dataframe(df, n_bins=args.bins)
-
-    print()
-    print("=" * 60)
-    print(tm.summary())
-    print("=" * 60)
-
-    # Speed profile summary
-    sp = tm.get_speed_profile()
-    print()
-    print("Speed profile (sample points):")
-    print(f"  {'pct':>6s}  {'min':>8s}  {'typical':>8s}  {'max':>8s}")
-    indices = np.linspace(0, len(sp) - 1, 10, dtype=int)
-    for idx in indices:
-        row = sp[idx]
-        print(f"  {row[0]:6.3f}  {row[1]:8.4f}  {row[2]:8.4f}  {row[3]:8.4f}")
-
-    # Save
-    if args.output:
-        out_path = Path(args.output)
-    else:
-        out_path = data_path.parent / "track_map.json"
-    tm.save(str(out_path))
-
-
-if __name__ == "__main__":
-    main()
+    return track_map
