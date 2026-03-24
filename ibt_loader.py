@@ -108,11 +108,21 @@ def load_ibt_file(filepath: str) -> Optional[pd.DataFrame]:
         try:
             values = ibt.get_all(iracing_name)
             if values is not None:
-                arr = np.array(values, dtype=np.float32)
-                # Some iRacing channels return 2D arrays (e.g. per-wheel data).
-                # We only want scalar-per-tick channels — flatten or take first col.
+                # Some iRacing channels return per-wheel/per-tire data as
+                # lists of tuples.  np.array(..., dtype=float32) may fail
+                # or produce an object array.  Handle both cases.
+                try:
+                    arr = np.array(values, dtype=np.float32)
+                except (ValueError, TypeError):
+                    # Ragged or nested — try extracting first element per tick
+                    arr = np.array([v[0] if hasattr(v, '__len__') else v
+                                    for v in values], dtype=np.float32)
                 if arr.ndim > 1:
                     arr = arr[:, 0] if arr.shape[1] > 0 else arr.flatten()
+                elif arr.ndim == 1 and arr.dtype == object:
+                    # Object array of lists/tuples — take first element
+                    arr = np.array([v[0] if hasattr(v, '__len__') else v
+                                    for v in arr], dtype=np.float32)
                 data[canonical_name] = arr
         except Exception:
             logger.debug(f"Could not read channel {iracing_name} from {path.name}")
