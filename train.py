@@ -269,6 +269,8 @@ def main():
                         help="Track ID filter (e.g. 'sebring')")
     parser.add_argument("--car", default=None,
                         help="Car ID filter (e.g. 'mx5')")
+    parser.add_argument("--combo", default=None,
+                        help="Combo name filter (e.g. 'cadillacctsvr_summitpoint')")
     parser.add_argument("--all", action="store_true",
                         help="Train all track/car combos found in data folder")
     parser.add_argument("--config", default="config.yaml")
@@ -295,6 +297,11 @@ def main():
     # Find combos to train
     if args.all:
         combos = [d for d in data_root.iterdir() if d.is_dir()]
+    elif args.combo:
+        combos = [
+            d for d in data_root.iterdir()
+            if d.is_dir() and args.combo.lower() in d.name.lower()
+        ]
     elif args.track or args.car:
         pattern = f"{args.track or '*'}_{args.car or '*'}"
         combos = list(data_root.glob(pattern))
@@ -307,7 +314,7 @@ def main():
                 and (args.car is None or args.car.lower() in d.name.lower())
             ]
     else:
-        logger.error("Specify --track/--car or --all")
+        logger.error("Specify --combo, --track/--car, or --all")
         sys.exit(1)
 
     if not combos:
