@@ -26,13 +26,15 @@ Safety features:
 
 import sys
 import os
+import json
 import time
 import signal
 import logging
 import argparse
+from enum import Enum, auto
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 import yaml
@@ -100,6 +102,260 @@ def _resolve_sequence_history(cfg: dict):
         )
 
 
+PIT_EXIT_CONFIG_DIR = Path(__file__).parent / "pit_exit_configs"
+
+PIT_EXIT_DEFAULTS = {
+    "straight_duration": 5.0,
+    "turn_angle": -5.0,
+    "turn_duration": 1.2,
+    "turn_throttle": 0.2,
+    "straight_throttle": 0.2,
+    "ramp_duration": 0.5,
+    "cruise_until_lap_pct": 0.04,
+    "cruise_throttle": 0.2,
+    "pit_exit_track_pos": 0.0,
+    "stall_pullout_left_dur": 0.0,
+    "stall_pullout_right_dur": 0.0,
+    "stall_pullout_steer": 0.35,
+    "stall_pullout_throttle": 0.2,
+}
+
+
+class PitExitPhase(Enum):
+    IDLE = auto()
+    STALL_PULLOUT_LEFT = auto()
+    STALL_PULLOUT_RIGHT = auto()
+    STRAIGHT = auto()
+    TURN = auto()
+    RAMP = auto()
+    CRUISE = auto()
+    COMPLETE = auto()
+
+
+class PitExitExecutor:
+    """
+    Phase-based state machine for driving out of the pits.
+
+    Reads a per-track JSON config and steps through:
+      STALL_PULLOUT_LEFT -> STALL_PULLOUT_RIGHT -> STRAIGHT -> TURN -> RAMP -> CRUISE -> COMPLETE
+    Phases with zero duration are skipped.
+    Returns (throttle, brake, steering) each tick, or None when complete (handoff to model).
+    """
+
+    # Phase order for advancing
+    PHASE_ORDER = [
+        PitExitPhase.STALL_PULLOUT_LEFT,
+        PitExitPhase.STALL_PULLOUT_RIGHT,
+        PitExitPhase.STRAIGHT,
+        PitExitPhase.TURN,
+        PitExitPhase.RAMP,
+        PitExitPhase.CRUISE,
+        PitExitPhase.COMPLETE,
+    ]
+
+    def __init__(self, config_dir: Path = PIT_EXIT_CONFIG_DIR):
+        self.config_dir = config_dir
+        self.config: dict = dict(PIT_EXIT_DEFAULTS)
+        self.phase = PitExitPhase.IDLE
+        self.phase_start_time = 0.0
+        self.activate_time = 0.0
+        self.turn_steer_at_ramp_start = 0.0
+        self._active = False
+        self._config_loaded = False
+
+    def load_config(self, combo_name: str) -> bool:
+        """Load pit exit config for a given track/car combo. Returns True if found."""
+        self.config_dir.mkdir(exist_ok=True)
+
+        # Try exact match first, then fuzzy keyword match
+        path = self.config_dir / f"{combo_name}.json"
+        if not path.exists():
+            path = self._fuzzy_match(combo_name)
+
+        if path and path.exists():
+            with open(path) as f:
+                loaded = json.load(f)
+            self.config = {**PIT_EXIT_DEFAULTS, **loaded}
+            self._config_loaded = True
+            logger.info(f"Pit exit config loaded: {path.name}")
+            return True
+
+        logger.warning(
+            f"No pit exit config for '{combo_name}'. "
+            f"Using defaults. Run pit_exit_gui.py to configure."
+        )
+        self.config = dict(PIT_EXIT_DEFAULTS)
+        self._config_loaded = False
+        return False
+
+    def _fuzzy_match(self, combo_name: str) -> Optional[Path]:
+        """Try to match combo name to existing configs by keyword overlap."""
+        if not self.config_dir.exists():
+            return None
+        keywords = {k for k in combo_name.split("_") if len(k) > 2}
+        best_path = None
+        best_score = 0
+        for p in self.config_dir.glob("*.json"):
+            score = sum(1 for kw in keywords if kw in p.stem)
+            if score > best_score:
+                best_score = score
+                best_path = p
+        if best_score > 0:
+            logger.info(f"Pit exit config fuzzy match: {best_path.name} (score {best_score})")
+            return best_path
+        return None
+
+    def activate(self):
+        """Called when car enters pit road. Resets state machine to first phase."""
+        now = time.perf_counter()
+        self._active = True
+        self.activate_time = now
+        # Start at first non-zero phase
+        self.phase = PitExitPhase.IDLE
+        self._advance_phase(now)
+        logger.info(f"Pit exit executor ACTIVATED - phase: {self.phase.name}")
+
+    def deactivate(self):
+        """Force deactivate (e.g., session ended)."""
+        self._active = False
+        self.phase = PitExitPhase.IDLE
+
+    @property
+    def is_active(self) -> bool:
+        return self._active
+
+    def tick(self, state: CarState) -> Optional[Tuple[float, float, float]]:
+        """
+        Called each frame while pit exit is active.
+        Returns (throttle, brake, steering) or None if complete.
+        """
+        if not self._active:
+            return None
+
+        if self.phase == PitExitPhase.COMPLETE:
+            logger.info("Pit exit complete -- handing off to model")
+            self._active = False
+            self.phase = PitExitPhase.IDLE
+            return None
+
+        now = time.perf_counter()
+        elapsed = now - self.phase_start_time
+        cfg = self.config
+
+        throttle = 0.0
+        brake = 0.0
+        steering = 0.0
+
+        if self.phase == PitExitPhase.STALL_PULLOUT_LEFT:
+            duration = cfg["stall_pullout_left_dur"]
+            if elapsed >= duration:
+                self._advance_phase(now)
+                return self.tick(state)  # recurse into next phase
+            throttle = cfg["stall_pullout_throttle"]
+            steering = -abs(cfg["stall_pullout_steer"])  # left = negative
+
+        elif self.phase == PitExitPhase.STALL_PULLOUT_RIGHT:
+            duration = cfg["stall_pullout_right_dur"]
+            if elapsed >= duration:
+                self._advance_phase(now)
+                return self.tick(state)
+            throttle = cfg["stall_pullout_throttle"]
+            steering = abs(cfg["stall_pullout_steer"])  # right = positive
+
+        elif self.phase == PitExitPhase.STRAIGHT:
+            duration = cfg["straight_duration"]
+            if elapsed >= duration:
+                self._advance_phase(now)
+                return self.tick(state)
+            throttle = cfg["straight_throttle"]
+            steering = 0.0
+
+        elif self.phase == PitExitPhase.TURN:
+            duration = cfg["turn_duration"]
+            if elapsed >= duration:
+                # Save turn steering for ramp interpolation
+                self.turn_steer_at_ramp_start = cfg["turn_angle"] / 30.0
+                self._advance_phase(now)
+                return self.tick(state)
+            throttle = cfg["turn_throttle"]
+            # Normalize degrees to -1..+1 range (assume ~30 deg max lock)
+            steering = cfg["turn_angle"] / 30.0
+            steering = max(-1.0, min(1.0, steering))
+
+        elif self.phase == PitExitPhase.RAMP:
+            duration = cfg["ramp_duration"]
+            if duration <= 0 or elapsed >= duration:
+                self._advance_phase(now)
+                return self.tick(state)
+            # Linearly interpolate steering from turn angle back to 0
+            progress = elapsed / duration
+            steering = self.turn_steer_at_ramp_start * (1.0 - progress)
+            throttle = cfg["cruise_throttle"]
+
+        elif self.phase == PitExitPhase.CRUISE:
+            # Cruise until we reach the target lap_dist_pct
+            target_pct = cfg["cruise_until_lap_pct"]
+            # Minimum 1 second in cruise to avoid instant handoff
+            min_cruise = 1.0
+            if elapsed >= min_cruise and state.lap_dist_pct >= target_pct and target_pct > 0:
+                self._advance_phase(now)
+                return self.tick(state)
+            # Also cap cruise at 30 seconds as a safety timeout
+            if elapsed >= 30.0:
+                logger.warning("Pit exit cruise phase timed out (30s)")
+                self._advance_phase(now)
+                return self.tick(state)
+            throttle = cfg["cruise_throttle"]
+            steering = 0.0
+
+        # Gear management: 1st below 5 m/s, 2nd above
+        # (gear shifts handled by orchestrator, we just return controls)
+
+        return throttle, brake, steering
+
+    def _advance_phase(self, now: float):
+        """Move to the next phase, skipping zero-duration phases."""
+        if self.phase == PitExitPhase.IDLE:
+            idx = 0
+        else:
+            try:
+                idx = self.PHASE_ORDER.index(self.phase) + 1
+            except ValueError:
+                idx = len(self.PHASE_ORDER) - 1
+
+        while idx < len(self.PHASE_ORDER):
+            candidate = self.PHASE_ORDER[idx]
+
+            # Check if this phase should be skipped (zero duration)
+            skip = False
+            if candidate == PitExitPhase.STALL_PULLOUT_LEFT:
+                skip = self.config.get("stall_pullout_left_dur", 0.0) <= 0
+            elif candidate == PitExitPhase.STALL_PULLOUT_RIGHT:
+                skip = self.config.get("stall_pullout_right_dur", 0.0) <= 0
+            elif candidate == PitExitPhase.RAMP:
+                skip = self.config.get("ramp_duration", 0.0) <= 0
+
+            if skip:
+                idx += 1
+                continue
+
+            self.phase = candidate
+            self.phase_start_time = now
+            logger.info(f"Pit exit phase: {self.phase.name}")
+            return
+
+        # Ran out of phases
+        self.phase = PitExitPhase.COMPLETE
+        self.phase_start_time = now
+
+    def get_status(self) -> str:
+        """Return human-readable status for logging."""
+        if not self._active:
+            return "IDLE"
+        elapsed = time.perf_counter() - self.phase_start_time
+        return f"{self.phase.name} ({elapsed:.1f}s)"
+
+
 class BotOrchestrator:
     """
     Main control loop: read telemetry -> predict -> safety check -> send inputs.
@@ -136,9 +392,8 @@ class BotOrchestrator:
         self._session_start = 0.0
         self._loop_times = []  # for Hz monitoring
 
-        # Pit exit autopilot state
-        self._pit_exit_active = False
-        self._pit_exit_logged = False
+        # Pit exit executor (phase-based, config-driven)
+        self._pit_exit = PitExitExecutor()
 
         # Safety stats
         self._safety_kills = 0
@@ -147,66 +402,6 @@ class BotOrchestrator:
         # Register Ctrl+C handler
         signal.signal(signal.SIGINT, self._shutdown_handler)
         signal.signal(signal.SIGTERM, self._shutdown_handler)
-
-    def _pit_exit_autopilot(self, state) -> tuple:
-        """
-        Simple autopilot to drive out of pit lane onto the track.
-
-        Strategy:
-          - 1st gear, gentle throttle (respect pit speed limit ~60 km/h)
-          - Straight steering (pit lanes are mostly straight)
-          - Slight steering correction based on lateral G to stay centered
-          - Disengage once OnPitRoad goes False (car has exited pit lane)
-
-        Returns:
-            (throttle, brake, steering) or None if pit exit is complete
-        """
-        if not state.on_pit_road:
-            # We've exited the pits
-            if self._pit_exit_active:
-                logger.info("Pit exit complete -- handing off to model")
-                self._pit_exit_active = False
-            return None
-
-        if not self._pit_exit_active:
-            self._pit_exit_active = True
-            logger.info("Pit exit autopilot engaged")
-
-        # Use safety controller's pit speed limit
-        pit_limit = self.safety.config.pit_speed_limit_ms
-
-        # Gentle throttle to get moving, back off near speed limit
-        if state.speed < 2.0:
-            throttle = 0.5
-        elif state.speed < pit_limit * 0.8:
-            throttle = 0.4
-        elif state.speed < pit_limit:
-            throttle = 0.15  # coast near limit
-        else:
-            throttle = 0.0   # over limit, lift
-
-        brake = 0.0
-
-        # Minimal steering correction using lateral G
-        steer_correction = -state.lat_g * 0.005
-        steering = max(-0.15, min(0.15, steer_correction))
-
-        # Shift to 1st if needed, then 2nd once rolling
-        if state.speed < 5.0:
-            target_gear = 1
-        else:
-            target_gear = 2
-
-        if target_gear != self.controller._current_gear:
-            self.controller.shift_to(target_gear)
-
-        if self._frame_count % 60 == 0:
-            logger.info(
-                f"PIT EXIT: thr={throttle:.2f} steer={steering:.3f} "
-                f"speed={state.speed:.1f}m/s gear={target_gear}"
-            )
-
-        return throttle, brake, steering
 
     def _match_checkpoint(self, raw_combo: str) -> str:
         """Match auto-detected combo to an existing checkpoint folder."""
@@ -272,6 +467,9 @@ class BotOrchestrator:
             else:
                 logger.warning("Mock mode: running without model (random outputs)")
 
+        # Load pit exit config for this combo
+        self._pit_exit.load_config(combo_name)
+
         # Load track map if available
         self.agent.load_track_map(combo_name)
         if self.agent.has_track_map:
@@ -322,6 +520,7 @@ class BotOrchestrator:
                 if new_combo != combo_name:
                     logger.info(f"Auto-switching model to {new_combo}")
                     self.agent.load_checkpoint(new_combo)
+                    self._pit_exit.load_config(new_combo)
                     self.agent.load_track_map(new_combo)
                     if self.agent.has_track_map:
                         self.tracker = LiveTracker(
@@ -343,20 +542,39 @@ class BotOrchestrator:
                     f"yaw={state.yaw_rate:.2f}rad/s"
                 )
 
-            # --- Pit exit autopilot ---
-            if state.on_pit_road and state.session_active:
-                pit_result = self._pit_exit_autopilot(state)
+            # --- Pit exit executor (phase-based) ---
+            if (state.on_pit_road or self._pit_exit.is_active) and state.session_active:
+                if not self._pit_exit.is_active and state.on_pit_road:
+                    self._pit_exit.activate()
+
+                pit_result = self._pit_exit.tick(state)
                 if pit_result is not None:
                     throttle, brake, steering = pit_result
 
-                    # Still run safety on pit autopilot outputs
+                    # Gear management during pit exit
+                    if state.speed < 5.0:
+                        target_gear = 1
+                    else:
+                        target_gear = 2
+                    if target_gear != self.controller._current_gear:
+                        self.controller.shift_to(target_gear)
+
+                    # Still run safety on pit exit outputs
                     verdict = self.safety.check(
                         state, throttle, brake, steering,
                         is_on_track=state.is_on_track,
-                        on_pit_road=True,
+                        on_pit_road=state.on_pit_road,
                         session_active=state.session_active,
                     )
                     self._apply_verdict(verdict, state)
+
+                    if self._frame_count % 60 == 0:
+                        logger.info(
+                            f"PIT EXIT [{self._pit_exit.get_status()}]: "
+                            f"thr={throttle:.2f} steer={steering:.3f} "
+                            f"speed={state.speed:.1f}m/s"
+                        )
+
                     self._frame_count += 1
                     self._sleep_remaining(loop_start, target_period)
                     continue
