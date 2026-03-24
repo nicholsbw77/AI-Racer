@@ -160,6 +160,8 @@ class PitExitExecutor:
         self.phase_start_time = 0.0
         self.activate_time = 0.0
         self.turn_steer_at_ramp_start = 0.0
+        self.start_lap_pct = 0.0  # lap_pct when pit exit started
+        self._crossed_sf = False   # have we crossed start/finish during exit?
         self._active = False
         self._config_loaded = False
 
@@ -205,15 +207,17 @@ class PitExitExecutor:
             return best_path
         return None
 
-    def activate(self):
+    def activate(self, lap_dist_pct: float = 0.0):
         """Called when car enters pit road. Resets state machine to first phase."""
         now = time.perf_counter()
         self._active = True
         self.activate_time = now
+        self.start_lap_pct = lap_dist_pct
+        self._crossed_sf = False
         # Start at first non-zero phase
         self.phase = PitExitPhase.IDLE
         self._advance_phase(now)
-        logger.info(f"Pit exit executor ACTIVATED - phase: {self.phase.name}")
+        logger.info(f"Pit exit executor ACTIVATED at lap_pct={lap_dist_pct:.3f} - phase: {self.phase.name}")
 
     def deactivate(self):
         """Force deactivate (e.g., session ended)."""
@@ -295,12 +299,27 @@ class PitExitExecutor:
         elif self.phase == PitExitPhase.CRUISE:
             # Cruise until we reach the target lap_dist_pct
             target_pct = cfg["cruise_until_lap_pct"]
-            # Minimum 1 second in cruise to avoid instant handoff
             min_cruise = 1.0
-            if elapsed >= min_cruise and state.lap_dist_pct >= target_pct and target_pct > 0:
+
+            # Detect start/finish crossing (pit starts near 0.95, target near 0.04)
+            if state.lap_dist_pct < 0.5 and self.start_lap_pct > 0.5:
+                self._crossed_sf = True
+
+            # Check exit condition — handle wrap-around
+            reached_target = False
+            if target_pct > 0 and elapsed >= min_cruise:
+                if self.start_lap_pct > target_pct:
+                    # Wrap-around case: started at e.g. 0.948, target 0.04
+                    # Must cross S/F first, then reach target
+                    reached_target = self._crossed_sf and state.lap_dist_pct >= target_pct
+                else:
+                    # Normal case: target is ahead
+                    reached_target = state.lap_dist_pct >= target_pct
+
+            if reached_target:
                 self._advance_phase(now)
                 return self.tick(state)
-            # Also cap cruise at 30 seconds as a safety timeout
+            # Safety timeout
             if elapsed >= 30.0:
                 logger.warning("Pit exit cruise phase timed out (30s)")
                 self._advance_phase(now)
@@ -545,28 +564,32 @@ class BotOrchestrator:
             # --- Pit exit executor (phase-based) ---
             if (state.on_pit_road or self._pit_exit.is_active) and state.session_active:
                 if not self._pit_exit.is_active and state.on_pit_road:
-                    self._pit_exit.activate()
+                    self._pit_exit.activate(state.lap_dist_pct)
 
                 pit_result = self._pit_exit.tick(state)
                 if pit_result is not None:
                     throttle, brake, steering = pit_result
 
                     # Gear management during pit exit
-                    if state.speed < 5.0:
+                    # Stay in 2nd once rolling — downshifting mid-exit stalls the car
+                    if state.speed < 2.0 and state.gear < 1:
                         target_gear = 1
-                    else:
+                    elif state.speed > 4.0:
                         target_gear = 2
-                    if target_gear != self.controller._current_gear:
+                    else:
+                        target_gear = max(1, int(state.gear))
+                    if target_gear != self.controller._current_gear and target_gear > 0:
                         self.controller.shift_to(target_gear)
 
-                    # Still run safety on pit exit outputs
-                    verdict = self.safety.check(
-                        state, throttle, brake, steering,
-                        is_on_track=state.is_on_track,
-                        on_pit_road=state.on_pit_road,
-                        session_active=state.session_active,
-                    )
-                    self._apply_verdict(verdict, state)
+                    # Send pit exit controls directly to controller
+                    # Skip the full safety stack during pit exit — it causes
+                    # false spin detection from noisy G-force telemetry and
+                    # kills throttle. Only enforce pit speed governor.
+                    pit_limit = self.safety.config.pit_speed_limit_ms
+                    if state.on_pit_road and state.speed > pit_limit * 1.05:
+                        throttle = 0.0
+                        brake = min(0.5, (state.speed - pit_limit) / pit_limit)
+                    self.controller.set_inputs(throttle, brake, steering)
 
                     if self._frame_count % 60 == 0:
                         logger.info(
