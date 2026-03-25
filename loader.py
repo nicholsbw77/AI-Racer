@@ -237,16 +237,34 @@ def compute_lap_times(df: pd.DataFrame) -> pd.Series:
     return df.groupby("lapIndex")["lap_time"].max()
 
 
-def filter_clean_laps(df: pd.DataFrame, threshold: float = 1.01) -> pd.DataFrame:
+def filter_clean_laps(
+    df: pd.DataFrame,
+    threshold: float = 1.01,
+    min_lap_time_s: float = 0.0,
+) -> pd.DataFrame:
     """
     Keep only laps within `threshold` * personal best lap time.
-    This ensures we only train on quality representative laps.
+    Laps shorter than `min_lap_time_s` are treated as partial/out-laps and
+    excluded before computing the personal best so they don't corrupt the
+    cutoff (e.g. a 5s out-lap starting near S/F would otherwise set PB=5s
+    and filter every real lap).
     """
     if "lapIndex" not in df.columns:
         return df
 
     lap_times = compute_lap_times(df)
     if len(lap_times) == 0:
+        return df
+
+    # Drop partial laps (too short to be a real timed lap)
+    if min_lap_time_s > 0:
+        n_partial = int((lap_times < min_lap_time_s).sum())
+        if n_partial:
+            logger.info(f"Dropping {n_partial} partial lap(s) under {min_lap_time_s:.0f}s")
+        lap_times = lap_times[lap_times >= min_lap_time_s]
+
+    if len(lap_times) == 0:
+        logger.warning("No valid laps remain after partial-lap filter — keeping all frames")
         return df
 
     personal_best = lap_times.min()

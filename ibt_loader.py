@@ -45,17 +45,22 @@ except ImportError:
 # iRacing channel name → our canonical name
 # ---------------------------------------------------------------------------
 IBT_CHANNEL_MAP = {
-    "Speed":              "speed",       # m/s
-    "Throttle":           "throttle",    # 0-1
-    "Brake":              "brake",       # 0-1
-    "SteeringWheelAngle": "steering",    # radians
-    "Gear":               "gear",        # integer
+    "Speed":              "speed",            # m/s
+    "Throttle":           "throttle",         # 0-1
+    "Brake":              "brake",            # 0-1
+    "SteeringWheelAngle": "steering",         # radians
+    "Gear":               "gear",             # integer
     "RPM":                "rpm",
-    "LatAccel":           "lat_g",       # m/s²
-    "LongAccel":          "lon_g",       # m/s²
-    "LapDistPct":         "lap_dist_pct",# 0-1
-    "Lap":                "lapIndex",    # lap counter
-    "SessionTime":        "session_time",# seconds
+    "LatAccel":           "lat_g",            # m/s²
+    "LongAccel":          "lon_g",            # m/s²
+    "LapDistPct":         "lap_dist_pct",     # 0-1
+    "Lap":                "lapIndex",         # lap counter (increments at S/F)
+    "SessionTime":        "session_time",     # seconds
+    # Lap timing — LapCurrentLapTime resets to 0 at S/F; max within a
+    # lapIndex group = completed lap time.  Required by compute_lap_times().
+    "LapCurrentLapTime":  "lap_time",         # seconds, current lap elapsed
+    "LapLastLapTime":     "lap_last_time",    # seconds, previous lap completed
+    "LapBestLapTime":     "lap_best_time",    # seconds, session best so far
 }
 
 REQUIRED_CHANNELS = {"Speed", "Throttle", "Brake", "SteeringWheelAngle", "LapDistPct"}

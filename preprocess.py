@@ -135,15 +135,19 @@ def preprocess_combo(
 
     combined = pd.concat(all_dfs, ignore_index=True)
 
-    # Lap time stats before filtering
-    lap_times = compute_lap_times(combined)
-    personal_best = float(lap_times.min()) if len(lap_times) > 0 else None
-    total_laps = len(lap_times)
+    # Count total laps before filtering
+    lap_times_raw = compute_lap_times(combined)
+    total_laps = len(lap_times_raw)
 
-    # Filter to clean laps only
+    # Filter to clean laps only (partial out-laps dropped first)
     threshold = cfg["training"]["clean_lap_threshold"]
-    combined = filter_clean_laps(combined, threshold)
-    clean_laps = len(compute_lap_times(combined))
+    min_lap_s  = cfg["training"].get("min_lap_time_s", 0.0)
+    combined = filter_clean_laps(combined, threshold, min_lap_time_s=min_lap_s)
+
+    # Personal best from clean laps only (after partial-lap filter)
+    lap_times_clean = compute_lap_times(combined)
+    personal_best = float(lap_times_clean.min()) if len(lap_times_clean) > 0 else None
+    clean_laps = len(lap_times_clean)
 
     if len(combined) == 0:
         logger.warning(f"No clean laps in {combo_name}")

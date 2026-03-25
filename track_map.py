@@ -189,11 +189,21 @@ class TrackMap:
 
     def _classify_segments(self):
         """Classify each segment based on its telemetry profile."""
+        # Adaptive full-throttle threshold: 85% of the observed peak throttle.
+        # A hard-coded 0.85 would incorrectly classify all segments as non-full-
+        # throttle if the driver's controller or TC cap limits peak to ~0.7.
+        # Floor at 0.50 so very slow/cautious data doesn't label everything straight.
+        observed_max_throttle = max((s.ref_throttle for s in self.segments), default=1.0)
+        throttle_threshold = max(0.50, observed_max_throttle * 0.85)
+        logger.debug(
+            f"_classify_segments: observed_max_throttle={observed_max_throttle:.3f}, "
+            f"throttle_threshold={throttle_threshold:.3f}"
+        )
+
         for seg in self.segments:
             # Thresholds for classification
             steering_threshold = 0.05   # normalized, above this = cornering
             brake_threshold = 0.15      # above this = braking zone
-            throttle_threshold = 0.85   # above this = full throttle
             curvature_threshold = 0.3   # above this = significant corner
 
             seg.is_full_throttle = seg.ref_throttle > throttle_threshold
@@ -210,7 +220,10 @@ class TrackMap:
                 else:
                     seg.segment_type = SegmentType.CORNER_APEX
             elif seg.is_full_throttle and not seg.is_cornering:
-                if seg.speed_delta > 0.5:
+                # On short tracks the car is almost always still accelerating
+                # through the straight, so use a generous threshold (3 m/s per
+                # segment) to avoid labelling every straight ACCELERATION_ZONE.
+                if seg.speed_delta > 3.0:
                     seg.segment_type = SegmentType.ACCELERATION_ZONE
                 else:
                     seg.segment_type = SegmentType.STRAIGHT

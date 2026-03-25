@@ -1,6 +1,12 @@
 training:
   # Only train on laps within this % of your personal best
-  clean_lap_threshold: 1.01
+  clean_lap_threshold: 1.06
+
+  # Minimum lap time (seconds) to be considered a valid complete lap.
+  # Partial out-laps (e.g. starting mid-track near S/F) can look like tiny
+  # "laps" and corrupt the personal best, filtering out all real laps.
+  # Set to roughly half your expected lap time; ignored if 0.
+  min_lap_time_s: 30.0
 
   # Sample rate of your .ibt telemetry files.
   # iRacing records .ibt at 60Hz by default.
@@ -83,14 +89,14 @@ inference:
   # out of the pits and reaches a fast straight where the model has solid data.
   # Jefferson Rev: chicane ends ~pct=0.20 at ~38m/s; long straight peaks at 50m/s.
   # Raise this if the model is handed off too early (misses a corner after launch).
-  launch_min_speed_ms: 38.0
+  launch_min_speed_ms: 20.0
 
   # Map-guided launch phase: steering speed-scaling exponent.
   # steer = ref_steer * (speed / ref_speed) ^ launch_steer_power
   # 1.0 = linear (too little steer at low speed)
   # 0.5 = square-root (more steer at low speed, good starting point)
   # 0.0 = full ref_steer always (no scaling)
-  launch_steer_power: 0.5
+  launch_steer_power: 0.0
 
   # Safety cutoff - if speed < this (m/s), release all inputs
   # Prevents runaway if session ends or car stalls
@@ -184,7 +190,10 @@ features:
   # Max steering wheel angle (radians) for normalization
   # Common values: Mazda MX-5=450deg, GTE=450deg, Formula=270deg
   # Will be auto-detected from data if not set here
-  steering_lock_radians: null        # null = auto-detect
+  steering_lock_radians: null        # null = auto-detect from data (recommended)
+  # NOTE: iRacing's SteeringWheelAngle channel is in RADIANS (~±1.9 rad for the
+  # Cadillac), NOT physical degrees. Setting this to 360 would treat it as 360
+  # radians and compress all steering to ~0.005 — use null for auto-detection.
 
 safety:
   # Safety controller — prevents the AI from leaving the track
