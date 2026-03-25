@@ -152,9 +152,14 @@ def train_one_combo(
     # num_workers=0 on Windows avoids slow multiprocessing spawn overhead;
     # dataset fits in memory so DataLoader overhead is minimal
     num_workers = 0 if sys.platform == "win32" else 4
+
+    # Cap batch size to training set size so drop_last=True never drops
+    # the only batch (happens when a combo has very few clean laps).
+    effective_batch = min(train_cfg["batch_size"], len(train_set))
+
     train_loader = DataLoader(
         train_set,
-        batch_size=train_cfg["batch_size"],
+        batch_size=effective_batch,
         shuffle=True,
         num_workers=num_workers,
         pin_memory=True,
@@ -162,7 +167,7 @@ def train_one_combo(
     )
     val_loader = DataLoader(
         val_set,
-        batch_size=train_cfg["batch_size"] * 2,
+        batch_size=effective_batch * 2,
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,

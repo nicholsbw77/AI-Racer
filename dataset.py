@@ -15,12 +15,15 @@ Enhanced with:
   - Support for extended state features (yaw_rate, slip_angle)
 """
 
+import logging
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 from typing import Tuple, Optional
 
 from loader import STATE_FEATURES, ACTION_FEATURES, HISTORY_ACTIONS
+
+logger = logging.getLogger(__name__)
 
 
 class TelemetryDataset(Dataset):
@@ -198,6 +201,23 @@ def split_dataset(
     n_val_laps = max(1, int(len(unique_laps) * val_fraction))
     val_laps = set(unique_laps[:n_val_laps])
     train_laps = set(unique_laps[n_val_laps:])
+
+    if len(train_laps) == 0:
+        # Only 1 lap in the dataset — fall back to frame-level split so
+        # training always has data.  Slight temporal leakage is acceptable
+        # for tiny single-lap datasets.
+        logger.warning(
+            f"Only {len(unique_laps)} lap(s) available — "
+            "using frame-level train/val split instead of lap-level split"
+        )
+        all_idx = dataset.valid_indices.copy()
+        rng.shuffle(all_idx)
+        n_val = max(1, int(len(all_idx) * val_fraction))
+        val_indices = all_idx[:n_val]
+        train_indices = all_idx[n_val:]
+        train_subset = _IndexedSubset(dataset, train_indices)
+        val_subset = _IndexedSubset(dataset, val_indices)
+        return train_subset, val_subset
 
     # Build index subsets
     train_mask = np.array([lid in train_laps for lid in valid_lap_ids])
