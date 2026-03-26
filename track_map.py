@@ -75,6 +75,10 @@ class SegmentProfile:
     min_speed: float = 0.0
     max_speed: float = 0.0
 
+    # GPS center position (decimal degrees; 0.0 if GPS data was unavailable)
+    ref_lat: float = 0.0
+    ref_lon: float = 0.0
+
 
 @dataclass
 class TrackMapData:
@@ -158,6 +162,16 @@ class TrackMap:
 
                 seg.min_speed = float(seg_df["speed"].min()) if "speed" in seg_df else 0.0
                 seg.max_speed = float(seg_df["speed"].max()) if "speed" in seg_df else 0.0
+
+                # GPS center: exclude (0,0) frames from session init
+                if "gps_lat" in seg_df.columns and "gps_lon" in seg_df.columns:
+                    valid_gps = seg_df[
+                        (seg_df["gps_lat"].abs() > 0.001) &
+                        (seg_df["gps_lon"].abs() > 0.001)
+                    ]
+                    if len(valid_gps) > 0:
+                        seg.ref_lat = float(valid_gps["gps_lat"].mean())
+                        seg.ref_lon = float(valid_gps["gps_lon"].mean())
 
                 # Estimate curvature from steering angle and speed
                 # curvature ≈ |steering| / speed (simplified bicycle model)
@@ -246,6 +260,29 @@ class TrackMap:
     def get_segment_index(self, lap_dist_pct: float) -> int:
         """Get segment index for a given track position."""
         return int(lap_dist_pct * self.num_segments) % self.num_segments
+
+    def find_segment_by_gps(self, lat: float, lon: float) -> Optional[SegmentProfile]:
+        """
+        Find the nearest track segment by GPS position.
+
+        Uses equirectangular approximation (accurate to <1m for track-scale areas).
+        Returns None if GPS is unavailable (lat/lon == 0.0) or track map lacks GPS data.
+        """
+        if not self._built or abs(lat) < 0.001 or abs(lon) < 0.001:
+            return None
+        cos_lat = math.cos(math.radians(lat))
+        best_seg = None
+        best_dist_sq = float('inf')
+        for seg in self.segments:
+            if abs(seg.ref_lat) < 0.001 and abs(seg.ref_lon) < 0.001:
+                continue
+            dlat = (lat - seg.ref_lat) * 111319.9        # degrees → meters
+            dlon = (lon - seg.ref_lon) * 111319.9 * cos_lat
+            dist_sq = dlat * dlat + dlon * dlon
+            if dist_sq < best_dist_sq:
+                best_dist_sq = dist_sq
+                best_seg = seg
+        return best_seg
 
     def get_lookahead(
         self, lap_dist_pct: float, num_ahead: int = 5
@@ -420,6 +457,8 @@ class TrackMap:
                 "min_speed": round(seg.min_speed, 3),
                 "max_speed": round(seg.max_speed, 3),
                 "speed_delta": round(seg.speed_delta, 3),
+                "ref_lat": round(seg.ref_lat, 8),
+                "ref_lon": round(seg.ref_lon, 8),
             })
 
         Path(filepath).parent.mkdir(parents=True, exist_ok=True)
@@ -461,6 +500,8 @@ class TrackMap:
                     min_speed=seg_data.get("min_speed", 0),
                     max_speed=seg_data.get("max_speed", 0),
                     speed_delta=seg_data.get("speed_delta", 0),
+                    ref_lat=seg_data.get("ref_lat", 0.0),
+                    ref_lon=seg_data.get("ref_lon", 0.0),
                 )
                 seg.is_cornering = abs(seg.ref_steering) > 0.05
                 seg.is_braking = seg.ref_brake > 0.15

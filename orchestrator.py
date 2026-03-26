@@ -250,13 +250,18 @@ class PitExitExecutor:
         brake = 0.0
         steering = 0.0
 
+        # Track S/F crossing at every tick (car may cross during pre-cruise phases)
+        if state.lap_dist_pct < 0.5 and self.start_lap_pct > 0.5:
+            self._crossed_sf = True
+
         if self.phase == PitExitPhase.STALL_PULLOUT_LEFT:
             duration = cfg["stall_pullout_left_dur"]
             if elapsed >= duration:
                 self._advance_phase(now)
                 return self.tick(state)  # recurse into next phase
             throttle = cfg["stall_pullout_throttle"]
-            steering = -abs(cfg["stall_pullout_steer"])  # left = negative
+            # Positive value → after _steer_sign(-1) → negative vJoy → LEFT turn
+            steering = abs(cfg["stall_pullout_steer"])
 
         elif self.phase == PitExitPhase.STALL_PULLOUT_RIGHT:
             duration = cfg["stall_pullout_right_dur"]
@@ -264,7 +269,8 @@ class PitExitExecutor:
                 self._advance_phase(now)
                 return self.tick(state)
             throttle = cfg["stall_pullout_throttle"]
-            steering = abs(cfg["stall_pullout_steer"])  # right = positive
+            # Negative value → after _steer_sign(-1) → positive vJoy → RIGHT turn
+            steering = -abs(cfg["stall_pullout_steer"])
 
         elif self.phase == PitExitPhase.STRAIGHT:
             duration = cfg["straight_duration"]
@@ -301,24 +307,31 @@ class PitExitExecutor:
             target_pct = cfg["cruise_until_lap_pct"]
             min_cruise = 1.0
 
-            # Detect start/finish crossing (pit starts near 0.95, target near 0.04)
-            if state.lap_dist_pct < 0.5 and self.start_lap_pct > 0.5:
-                self._crossed_sf = True
-
             # Check exit condition — handle wrap-around
+            # True wrap-around only when pit lane is near END of track (start_lap_pct > 0.5)
+            # and target is near START (target_pct < 0.5). e.g. pit at 0.948, target 0.04.
+            # If pit exits near the start (start_lap_pct < 0.5) and target < start,
+            # the car already passed the target — hand off after min_cruise.
             reached_target = False
             if target_pct <= 0:
                 # cruise_until_lap_pct=0 means: hand off to model as soon as
                 # the car is off pit road (with a 1s minimum to settle).
                 reached_target = not state.on_pit_road and elapsed >= min_cruise
             elif elapsed >= min_cruise:
-                if self.start_lap_pct > target_pct:
-                    # Wrap-around case: started at e.g. 0.948, target 0.04
+                if self.start_lap_pct > 0.5 and target_pct < 0.5:
+                    # True wrap-around: pit near end of track, target near start
                     # Must cross S/F first, then reach target
                     reached_target = self._crossed_sf and state.lap_dist_pct >= target_pct
+                elif state.lap_dist_pct >= target_pct:
+                    # Normal case: target is ahead of current position
+                    reached_target = True
+                elif state.lap_dist_pct < self.start_lap_pct and self.start_lap_pct <= target_pct:
+                    # Car went backwards past start somehow — safety fallback
+                    reached_target = True
                 else:
-                    # Normal case: target is ahead
-                    reached_target = state.lap_dist_pct >= target_pct
+                    # Car already past target when cruise began (pit exit past target point)
+                    # e.g. pit exits at 0.089, target was 0.002 — already passed it
+                    reached_target = elapsed >= min_cruise * 2
 
             if reached_target:
                 self._advance_phase(now)
@@ -329,7 +342,11 @@ class PitExitExecutor:
                 self._advance_phase(now)
                 return self.tick(state)
             throttle = cfg["cruise_throttle"]
-            steering = 0.0
+            # cruise_steering: small constant steer to follow curved pit roads
+            # (e.g. oval tracks where pit road curves through turns 1-2).
+            # Positive = left turn after steer_invert; negative = right turn.
+            # Defaults to 0.0 (straight pit road / road course).
+            steering = float(cfg.get("cruise_steering", 0.0))
 
         # Gear management: 1st below 5 m/s, 2nd above
         # (gear shifts handled by orchestrator, we just return controls)
@@ -604,23 +621,32 @@ class BotOrchestrator:
 
                 pit_result = self._pit_exit.tick(state)
                 if pit_result is None:
-                    # Pit exit just completed — activate map-guided launch if we
-                    # have a track map (guides the car to race speed before the
-                    # model takes over; avoids out-of-distribution slow-speed chaos).
-                    if self.agent.has_track_map:
-                        self._map_launch_active = True
-                        logger.info(
-                            f"Map-guided launch activated at pct={state.lap_dist_pct:.3f} "
-                            f"speed={state.speed:.1f}m/s — target >{self._map_launch_min_speed_ms:.0f}m/s"
-                        )
-                    else:
-                        # No track map — pre-warm and hand off immediately
+                    # Pit exit just completed — decide whether to activate the
+                    # map-guided launch or hand straight to the model.
+                    pit_cfg = self._pit_exit.config
+                    if "launch_min_speed_ms" in pit_cfg:
+                        self._map_launch_min_speed_ms = float(pit_cfg["launch_min_speed_ms"])
+
+                    skip_launch = self._map_launch_min_speed_ms <= 0 or not self.agent.has_track_map
+
+                    if skip_launch:
+                        # launch_min_speed_ms=0 in pit config means: skip map
+                        # launch entirely and hand off directly to the model.
+                        # Use this when the pit exit speed is already close to
+                        # the training distribution (e.g. slow road-course corners
+                        # right after pit exit).
                         steer_lock = self.telemetry._steering_lock
                         steer_norm = float(np.clip(state.steering / steer_lock, -1.0, 1.0))
                         self.telemetry.prewarm_history(float(state.throttle), 0.0, steer_norm)
                         logger.info(
-                            f"Model handoff (no map) pct={state.lap_dist_pct:.3f} "
-                            f"speed={state.speed:.1f}m/s"
+                            f"Pit exit complete — direct model handoff "
+                            f"pct={state.lap_dist_pct:.3f} speed={state.speed:.1f}m/s"
+                        )
+                    else:
+                        self._map_launch_active = True
+                        logger.info(
+                            f"Map-guided launch activated at pct={state.lap_dist_pct:.3f} "
+                            f"speed={state.speed:.1f}m/s — target >{self._map_launch_min_speed_ms:.0f}m/s"
                         )
                 if pit_result is not None:
                     throttle, brake, steering = pit_result
@@ -662,7 +688,11 @@ class BotOrchestrator:
             # reaches minimum race speed.  This prevents the model from seeing
             # an out-of-distribution slow-speed start that causes random outputs.
             if self._map_launch_active and state.session_active and state.is_on_track:
-                seg = self.agent.track_map.get_segment(state.lap_dist_pct)
+                # Prefer GPS-based segment lookup: more accurate when lap_dist_pct
+                # is unreliable (e.g. pit road exit, early-lap positioning).
+                seg = self.agent.track_map.find_segment_by_gps(state.gps_lat, state.gps_lon)
+                if seg is None:
+                    seg = self.agent.track_map.get_segment(state.lap_dist_pct)
 
                 # Exit condition: at race speed on a non-braking segment
                 at_speed = state.speed >= self._map_launch_min_speed_ms
@@ -683,10 +713,25 @@ class BotOrchestrator:
                     # Drive using track-map reference values.
                     # Use ref_steering for the racing line.
                     # Boost throttle to build speed quickly; respect corner braking.
+                    seg_type = seg.segment_type if seg else None
+                    is_straight_seg = seg_type in (
+                        SegmentType.STRAIGHT,
+                        SegmentType.ACCELERATION_ZONE,
+                        SegmentType.UNKNOWN,
+                        None,
+                    )
                     ref_steer = seg.ref_steering if seg else 0.0
                     ref_brake = seg.ref_brake if seg else 0.0
                     ref_thr   = seg.ref_throttle if seg else 0.5
                     ref_spd   = seg.ref_speed if seg else self._map_launch_min_speed_ms
+
+                    # On straight/unknown segments ref_steer can be bad data
+                    # (e.g. pit-exit merge area). Cap it so the car doesn't spin.
+                    if is_straight_seg:
+                        steer_cap = float(
+                            self.cfg.get("inference", {}).get("launch_straight_steer_cap", 0.08)
+                        )
+                        ref_steer = max(-steer_cap, min(steer_cap, ref_steer))
 
                     # Scale steering by (speed / ref_speed) ^ power.
                     # power=1.0 → linear (too little steer at low speed)
@@ -700,45 +745,59 @@ class BotOrchestrator:
                         speed_ratio = min(1.0, state.speed / ref_spd)
                         ref_steer = ref_steer * (speed_ratio ** _power)
 
-                    # In a braking zone / corner: respect reference values so the
-                    # car doesn't overpower at low speed.  Only boost on straights.
-                    steer_mag = abs(ref_steer)
-                    needs_brake = (
-                        seg is not None
-                        and seg.segment_type in (
-                            SegmentType.BRAKING_ZONE,
-                            SegmentType.CORNER_ENTRY,
-                            SegmentType.CORNER_APEX,
-                        )
-                        and state.speed > ref_spd * 0.9
+                    # Spin detection: if yaw rate is very high the car is already
+                    # rotating — counter-steer and cut throttle to recover.
+                    yaw_spin_thresh = float(
+                        self.cfg.get("inference", {}).get("launch_spin_yaw_thresh", 1.5)
                     )
-                    if needs_brake:
-                        # Active braking zone — follow reference exactly
-                        throttle = ref_thr
-                        brake = ref_brake
-                    elif steer_mag > 0.30:
-                        # Still in a corner (exit or apex) — use reference throttle,
-                        # boosting beyond it risks spinning at below-reference speed
-                        throttle = ref_thr
-                        brake = 0.0
-                    elif steer_mag > 0.10:
-                        # Gentle curve / unwinding — modest boost
-                        throttle = max(ref_thr, 0.5)
+                    is_spinning = abs(state.yaw_rate) > yaw_spin_thresh
+                    if is_spinning:
+                        # Counter-steer: oppose the spin direction
+                        counter = -float(np.sign(state.yaw_rate)) * 0.25
+                        ref_steer = counter
+                        throttle = 0.1
                         brake = 0.0
                     else:
-                        # Essentially straight — full throttle to build speed
-                        throttle = max(ref_thr, 0.8)
-                        brake = 0.0
+                        # In a braking zone / corner: respect reference values so the
+                        # car doesn't overpower at low speed.  Only boost on straights.
+                        steer_mag = abs(ref_steer)
+                        needs_brake = (
+                            seg is not None
+                            and seg.segment_type in (
+                                SegmentType.BRAKING_ZONE,
+                                SegmentType.CORNER_ENTRY,
+                                SegmentType.CORNER_APEX,
+                            )
+                            and state.speed > ref_spd * 0.9
+                        )
+                        if needs_brake:
+                            # Active braking zone — follow reference exactly
+                            throttle = ref_thr
+                            brake = ref_brake
+                        elif steer_mag > 0.30:
+                            # Still in a corner (exit or apex) — use reference throttle,
+                            # boosting beyond it risks spinning at below-reference speed
+                            throttle = ref_thr
+                            brake = 0.0
+                        elif steer_mag > 0.10:
+                            # Gentle curve / unwinding — modest boost
+                            throttle = max(ref_thr, 0.5)
+                            brake = 0.0
+                        else:
+                            # Essentially straight — full throttle to build speed
+                            throttle = max(ref_thr, 0.8)
+                            brake = 0.0
 
                     self.controller.set_inputs(throttle, brake, ref_steer * self._steer_sign)
 
                     if self._frame_count % 60 == 0:
-                        seg_name = seg.segment_type.name if seg else "?"
+                        seg_name = seg_type.name if seg_type else "?"
+                        spin_flag = " [SPIN]" if is_spinning else ""
                         logger.info(
-                            f"LAUNCH [{seg_name} pct={state.lap_dist_pct:.3f}]: "
+                            f"LAUNCH [{seg_name}{spin_flag} pct={state.lap_dist_pct:.3f}]: "
                             f"thr={throttle:.2f} brk={brake:.2f} "
                             f"steer={ref_steer:.3f} speed={state.speed:.1f}m/s "
-                            f"(ref={ref_spd:.1f}m/s)"
+                            f"(ref={ref_spd:.1f}m/s yaw={state.yaw_rate:.2f}rad/s)"
                         )
 
                     self._frame_count += 1

@@ -17,6 +17,8 @@ iRacing .ibt channel names used:
   LapDistPct        - 0-1 normalized distance around track
   Lap               - lap counter (increments at start/finish)
   SessionTime       - seconds since session start
+  Lat               - GPS latitude in decimal degrees
+  Lon               - GPS longitude in decimal degrees
 
 Usage:
   from ibt_loader import load_ibt_file, parse_combo_from_filename
@@ -61,6 +63,11 @@ IBT_CHANNEL_MAP = {
     "LapCurrentLapTime":  "lap_time",         # seconds, current lap elapsed
     "LapLastLapTime":     "lap_last_time",    # seconds, previous lap completed
     "LapBestLapTime":     "lap_best_time",    # seconds, session best so far
+    # GPS — available as decimal degrees in native iRacing .ibt format.
+    # iRacing stores full-precision doubles; frames before the session starts
+    # have (0.0, 0.0) which must be filtered out before use.
+    "Lat":                "gps_lat",          # decimal degrees latitude
+    "Lon":                "gps_lon",          # decimal degrees longitude
 }
 
 REQUIRED_CHANNELS = {"Speed", "Throttle", "Brake", "SteeringWheelAngle", "LapDistPct"}

@@ -1,6 +1,9 @@
 training:
   # Only train on laps within this % of your personal best
-  clean_lap_threshold: 1.06
+  # 1.06 = within 6% of PB (good for polished data with many consistent laps)
+  # 1.20 = within 20% of PB (keeps only your fast, consistent laps)
+  # 1.35 = within 35% of PB (includes improving mid-session laps)
+  clean_lap_threshold: 1.60
 
   # Minimum lap time (seconds) to be considered a valid complete lap.
   # Partial out-laps (e.g. starting mid-track near S/F) can look like tiny
@@ -82,7 +85,7 @@ inference:
   # If the vJoy axis maps negative → LEFT (wrong direction), set this to true
   # to flip all steering output before it reaches vJoy.
   # Test: does the car turn RIGHT when you expect it to? If not, flip this.
-  steer_invert: true
+  steer_invert: True
 
   # Map-guided launch phase: minimum speed (m/s) before handing off to the model.
   # Set high enough that the launch phase covers all slow-speed corners coming
@@ -97,6 +100,16 @@ inference:
   # 0.5 = square-root (more steer at low speed, good starting point)
   # 0.0 = full ref_steer always (no scaling)
   launch_steer_power: 0.0
+
+  # Maximum steering allowed on STRAIGHT/ACCELERATION/UNKNOWN segments during launch.
+  # Prevents bad ref_steer data at pit-exit merge area from spinning the car.
+  # Normalized 0..1 (e.g. 0.08 = 8% of steering lock, barely any input).
+  launch_straight_steer_cap: 0.08
+
+  # Yaw rate threshold (rad/s) for spin detection during map-guided launch.
+  # If |yaw_rate| exceeds this, counter-steer and cut throttle to recover.
+  # Charlotte superspeedway normal yaw ~0.1-0.3 rad/s; spin is >1.5 rad/s.
+  launch_spin_yaw_thresh: 1.5
 
   # Safety cutoff - if speed < this (m/s), release all inputs
   # Prevents runaway if session ends or car stalls

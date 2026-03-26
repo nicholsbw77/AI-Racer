@@ -75,6 +75,10 @@ class CarState:
     speed_delta: float = 0.0     # speed change from previous frame (m/s per tick)
     slip_angle: float = 0.0      # estimated slip angle (radians)
 
+    # GPS position (decimal degrees; 0.0 if unavailable or session not started)
+    gps_lat: float = 0.0
+    gps_lon: float = 0.0
+
     # Status flags
     is_on_track: bool = False
     on_pit_road: bool = False
@@ -315,6 +319,10 @@ class TelemetryReader:
         if speed > 3.0:
             slip_angle = np.arctan2(velocity_y, max(abs(velocity_x), 0.1))
 
+        # GPS position — (0.0, 0.0) during session init before car spawns
+        gps_lat = f(ir["Lat"]) if ir["Lat"] is not None else 0.0
+        gps_lon = f(ir["Lon"]) if ir["Lon"] is not None else 0.0
+
         # Update dynamic normalization constants
         self._speed_max = max(self._speed_max, speed * 1.05)
         self._rpm_max = max(self._rpm_max, rpm * 1.05)
@@ -336,6 +344,8 @@ class TelemetryReader:
             lap_number=lap_number,
             speed_delta=speed_delta,
             slip_angle=slip_angle,
+            gps_lat=gps_lat,
+            gps_lon=gps_lon,
             is_on_track=is_on_track,
             on_pit_road=on_pit_road,
             session_active=(session_state > 0),
