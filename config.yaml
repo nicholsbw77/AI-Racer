@@ -1,6 +1,15 @@
 training:
   # Only train on laps within this % of your personal best
-  clean_lap_threshold: 1.01
+  # 1.06 = within 6% of PB (good for polished data with many consistent laps)
+  # 1.20 = within 20% of PB (keeps only your fast, consistent laps)
+  # 1.35 = within 35% of PB (includes improving mid-session laps)
+  clean_lap_threshold: 1.60
+
+  # Minimum lap time (seconds) to be considered a valid complete lap.
+  # Partial out-laps (e.g. starting mid-track near S/F) can look like tiny
+  # "laps" and corrupt the personal best, filtering out all real laps.
+  # Set to roughly half your expected lap time; ignored if 0.
+  min_lap_time_s: 30.0
 
   # Sample rate of your .ibt telemetry files.
   # iRacing records .ibt at 60Hz by default.
@@ -29,6 +38,7 @@ training:
   throttle_loss_weight: 1.0
   brake_loss_weight: 1.2    # slightly higher - braking mistakes are costly
   steering_loss_weight: 1.5 # highest - steering errors compound quickly
+  boundary_weight: 0.3      # extra penalty on steering errors near track edges
 
   batch_size: 4096
   epochs: 300
@@ -49,6 +59,12 @@ inference:
   # Lower = smoother but more lag, higher = more responsive but jittery
   ema_alpha: 0.30
 
+  # Adaptive EMA: different alpha values for different track sections
+  # Braking zones and corners need faster response, straights can be smoother
+  ema_alpha_corner: 0.40
+  ema_alpha_braking: 0.50
+  ema_alpha_straight: 0.20
+
   # Target control loop frequency (Hz) - iRacing physics tick
   loop_hz: 60
 
@@ -64,9 +80,110 @@ inference:
   steering_min: -1.0
   steering_max: 1.0
 
+  # Steering axis inversion.
+  # iRacing records SteeringWheelAngle as negative for RIGHT turns.
+  # If the vJoy axis maps negative → LEFT (wrong direction), set this to true
+  # to flip all steering output before it reaches vJoy.
+  # Test: does the car turn RIGHT when you expect it to? If not, flip this.
+  steer_invert: True
+
+  # Map-guided launch phase: minimum speed (m/s) before handing off to the model.
+  # Set high enough that the launch phase covers all slow-speed corners coming
+  # out of the pits and reaches a fast straight where the model has solid data.
+  # Jefferson Rev: chicane ends ~pct=0.20 at ~38m/s; long straight peaks at 50m/s.
+  # Raise this if the model is handed off too early (misses a corner after launch).
+  launch_min_speed_ms: 20.0
+
+  # Map-guided launch phase: steering speed-scaling exponent.
+  # steer = ref_steer * (speed / ref_speed) ^ launch_steer_power
+  # 1.0 = linear (too little steer at low speed)
+  # 0.5 = square-root (more steer at low speed, good starting point)
+  # 0.0 = full ref_steer always (no scaling)
+  launch_steer_power: 0.0
+
+  # Maximum steering allowed on STRAIGHT/ACCELERATION/UNKNOWN segments during launch.
+  # Prevents bad ref_steer data at pit-exit merge area from spinning the car.
+  # Normalized 0..1 (e.g. 0.08 = 8% of steering lock, barely any input).
+  launch_straight_steer_cap: 0.08
+
+  # Yaw rate threshold (rad/s) for spin detection during map-guided launch.
+  # If |yaw_rate| exceeds this, counter-steer and cut throttle to recover.
+  # Charlotte superspeedway normal yaw ~0.1-0.3 rad/s; spin is >1.5 rad/s.
+  launch_spin_yaw_thresh: 1.5
+
   # Safety cutoff - if speed < this (m/s), release all inputs
   # Prevents runaway if session ends or car stalls
-  min_speed_cutoff: 2.0
+  min_speed_cutoff: 1.0
+
+# ------------------------------------------------------------------
+# Safety Controller Configuration
+# ------------------------------------------------------------------
+safety:
+  # Heartbeat watchdog: kill if no fresh telemetry for this many ms
+  heartbeat_timeout_ms: 200.0
+  heartbeat_max_failures: 3
+
+  # Speed envelope
+  min_speed_cutoff_ms: 2.0     # below this, only gentle throttle
+  crawl_speed_ms: 5.0          # below this, reduce steering authority
+  crawl_throttle: 0.3          # throttle when below min_speed
+  zero_speed_kill_frames: 300  # kill after this many frames at zero speed (5s @ 60Hz)
+
+  # G-force limits (m/s^2)
+  # ~1g = 9.81 m/s^2, racing cars can pull 3-4g
+  max_lat_g: 35.0              # ~3.5g lateral limit
+  max_lon_g: 40.0              # ~4.0g longitudinal limit
+  g_force_throttle_reduction: 0.5  # max throttle reduction at G limit
+
+  # Steering rate limiter
+  # Max steering change per tick (normalized -1 to 1 scale)
+  # Prevents snap oversteer from model oscillations
+  max_steering_rate: 0.15
+  emergency_steering_rate: 0.25  # allowed during hard braking
+
+  # Brake/throttle mutual exclusion
+  brake_throttle_threshold: 0.3  # brake above this reduces throttle
+
+  # Spin detection
+  spin_yaw_rate_threshold: 2.0   # rad/s yaw rate that indicates a spin
+  spin_detect_frames: 10         # consecutive frames to confirm spin
+  spin_recovery_timeout: 180     # max recovery frames (3s @ 60Hz)
+
+  # Stuck detection
+  stuck_speed_threshold: 1.0     # m/s - below this = possibly stuck
+  stuck_detect_frames: 600       # frames to confirm stuck (10s @ 60Hz)
+
+  # Lap time watchdog
+  # Kill if current lap takes longer than this multiplier of personal best
+  lap_time_kill_multiplier: 2.5
+
+  # Track boundary monitoring
+  track_edge_warning: 0.85       # boundary_pct above this = warning
+  track_edge_critical: 0.95      # boundary_pct above this = critical reduction
+  off_track_kill_frames: 60      # kill after this many off-track frames
+  boundary_speed_reduction: 0.6  # max throttle reduction at track edge
+
+  # Pit lane
+  pit_speed_limit_ms: 18.0      # ~65 km/h pit speed limit
+
+  # Incident management
+  incident_cooldown_s: 5.0       # seconds between incident detections
+  max_incidents_per_session: 10  # kill session after this many incidents
+
+# ------------------------------------------------------------------
+# Track Map / GPS Positioning Configuration
+# ------------------------------------------------------------------
+track:
+  # Number of segments to divide the track into
+  # Higher = more granular but needs more training data
+  num_segments: 100
+
+  # How many segments ahead to include in the state vector
+  # More lookahead = better anticipation of corners/braking
+  lookahead_segments: 5
+
+  # Auto-build track map during preprocessing
+  auto_build_map: true
 
 features:
   # All VRS/iRacing column names mapped to our normalized names
@@ -86,7 +203,22 @@ features:
   # Max steering wheel angle (radians) for normalization
   # Common values: Mazda MX-5=450deg, GTE=450deg, Formula=270deg
   # Will be auto-detected from data if not set here
-  steering_lock_radians: null        # null = auto-detect
+  steering_lock_radians: null        # null = auto-detect from data (recommended)
+  # NOTE: iRacing's SteeringWheelAngle channel is in RADIANS (~±1.9 rad for the
+  # Cadillac), NOT physical degrees. Setting this to 360 would treat it as 360
+  # radians and compress all steering to ~0.005 — use null for auto-detection.
+
+safety:
+  # Safety controller — prevents the AI from leaving the track
+  enabled: true
+  edge_warning_threshold: 0.75    # |track_pos| above this triggers gentle correction
+  edge_danger_threshold: 0.90     # |track_pos| above this triggers braking
+  max_lateral_g: 35.0             # m/s² (~3.5g) - reduce throttle above this
+  recovery_steer_gain: 0.5        # how aggressively to steer back toward center
+  recovery_brake: 0.8             # brake force during off-track recovery
+  max_blend_factor: 0.8           # max safety override (keep some model input)
+  off_track_frames_for_recovery: 3  # frames off-track before full recovery
+  speed_limit_ms: null            # optional per-track speed cap (m/s)
 
 paths:
   checkpoints: "checkpoints/"

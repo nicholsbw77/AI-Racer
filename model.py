@@ -12,6 +12,11 @@ Architecture rationale:
     activation functions and loss weightings
   - LayerNorm (not BatchNorm): works correctly with batch_size=1
     during single-sample inference at 360Hz
+
+Enhanced with:
+  - Track-aware input handling (variable input_dim supports track features)
+  - Wider steering head for better cornering precision
+  - Gradient-friendly initialization
 """
 
 import torch
@@ -52,7 +57,7 @@ class DrivingPolicyNet(nn.Module):
     """
     Main behavior cloning network.
 
-    Input:  state vector (current features + flattened action history)
+    Input:  state vector (current features + flattened action history + optional track features)
     Output: (throttle, brake, steering) tuple
 
     Output ranges:
@@ -87,6 +92,7 @@ class DrivingPolicyNet(nn.Module):
         final_dim = hidden_dims[-1]
 
         # Separate heads for each output - allows independent tuning
+        # Throttle head: straightforward 0-1 output
         self.throttle_head = nn.Sequential(
             nn.Linear(final_dim, 32),
             nn.GELU(),
@@ -94,6 +100,7 @@ class DrivingPolicyNet(nn.Module):
             nn.Sigmoid(),
         )
 
+        # Brake head: needs to be crisp for braking zones
         self.brake_head = nn.Sequential(
             nn.Linear(final_dim, 32),
             nn.GELU(),
@@ -101,10 +108,14 @@ class DrivingPolicyNet(nn.Module):
             nn.Sigmoid(),
         )
 
+        # Steering head: wider for better cornering precision
+        # Steering is the most critical output for lap completion
         self.steering_head = nn.Sequential(
             nn.Linear(final_dim, 64),
             nn.GELU(),
-            nn.Linear(64, 1),
+            nn.Linear(64, 32),
+            nn.GELU(),
+            nn.Linear(32, 1),
             nn.Tanh(),
         )
 
@@ -154,10 +165,14 @@ class DrivingPolicyNet(nn.Module):
 
 class BehaviorCloningLoss(nn.Module):
     """
-    Weighted MSE loss with smoothness penalty.
+    Weighted MSE loss with smoothness penalty and track boundary awareness.
 
     The smoothness penalty discourages large frame-to-frame changes
     in outputs, producing smoother driving that doesn't oscillate.
+
+    The boundary penalty increases steering loss weight when the car
+    is near the track edge, teaching the model that precision matters
+    most at the limits.
     """
 
     def __init__(
@@ -166,12 +181,14 @@ class BehaviorCloningLoss(nn.Module):
         brake_weight: float = 1.2,
         steering_weight: float = 1.5,
         smoothness_weight: float = 0.15,
+        boundary_weight: float = 0.3,
     ):
         super().__init__()
         self.w_thr = throttle_weight
         self.w_brk = brake_weight
         self.w_str = steering_weight
         self.w_smooth = smoothness_weight
+        self.w_boundary = boundary_weight
 
     def forward(
         self,
@@ -180,6 +197,7 @@ class BehaviorCloningLoss(nn.Module):
         pred_steering: torch.Tensor,
         target: torch.Tensor,  # (batch, 3) [throttle, brake, steering]
         prev_steering: Optional[torch.Tensor] = None,  # (batch, 1) last frame steering
+        track_pos: Optional[torch.Tensor] = None,  # (batch, 1) lateral position
     ) -> Tuple[torch.Tensor, dict]:
         """
         Returns (total_loss, loss_components_dict)
@@ -205,12 +223,26 @@ class BehaviorCloningLoss(nn.Module):
             smooth_loss = torch.mean(steering_delta ** 2)
             base_loss = base_loss + self.w_smooth * smooth_loss
 
+        # Boundary awareness penalty: increase loss near track edges
+        # When |track_pos| is high, steering errors are more costly
+        boundary_loss = torch.tensor(0.0, device=pred_steering.device)
+        if track_pos is not None and self.w_boundary > 0:
+            # Weight multiplier: 1.0 at center, up to 3.0 at edges
+            edge_proximity = torch.abs(track_pos).clamp(0.0, 1.0)
+            edge_weight = 1.0 + 2.0 * edge_proximity ** 2  # quadratic ramp
+            # Extra penalty on steering error when near edge
+            weighted_steer_err = edge_weight * (pred_steering - tgt_str) ** 2
+            boundary_loss = torch.mean(weighted_steer_err)
+            base_loss = base_loss + self.w_boundary * boundary_loss
+
         components = {
             "throttle": loss_thr.item(),
             "brake": loss_brk.item(),
             "steering": loss_str.item(),
             "smoothness": smooth_loss.item() if isinstance(smooth_loss, torch.Tensor)
                           else smooth_loss,
+            "boundary": boundary_loss.item() if isinstance(boundary_loss, torch.Tensor)
+                        else boundary_loss,
         }
 
         return base_loss, components

@@ -24,8 +24,9 @@ from torch.utils.data import DataLoader
 import yaml
 
 from loader import load_track_car_dataset
-from dataset import TelemetryDataset, split_dataset
+from dataset import TelemetryDataset, split_dataset, build_track_features_for_dataset
 from model import DrivingPolicyNet, BehaviorCloningLoss
+from track_map import TrackMap
 
 logging.basicConfig(
     level=logging.INFO,
@@ -87,8 +88,54 @@ def train_one_combo(
         logger.warning(f"Skipping {combo_name}: no data")
         return False
 
+    # --- Normalization constants from meta.yaml ---
+    # These must be saved in the checkpoint so inference uses the EXACT same
+    # scales as training (speed_max, steering_lock, rpm_max).
+    norm_constants = {}
+    meta_path = Path(combo_folder) / "meta.yaml"
+    if meta_path.exists():
+        with open(meta_path) as _mf:
+            _meta = yaml.safe_load(_mf)
+        norm_constants = {
+            "speed_max_ms":           _meta.get("speed_max_ms"),
+            "steering_lock_radians":  _meta.get("steering_lock_radians"),
+            "rpm_max":                _meta.get("rpm_max"),
+        }
+        logger.info(
+            f"Norm constants from meta.yaml: "
+            f"speed_max={norm_constants['speed_max_ms']:.2f} m/s  "
+            f"steer_lock={norm_constants['steering_lock_radians']:.4f} rad  "
+            f"rpm_max={norm_constants['rpm_max']:.0f}"
+        )
+
+    # --- Track features ---
+    track_features = None
+    track_cfg = cfg.get("track", {})
+    lookahead = track_cfg.get("lookahead_segments", 5)
+
+    # Look for track map in checkpoints or processed data folder
+    for map_dir in [
+        Path(cfg["paths"]["checkpoints"]) / combo_name,
+        Path(combo_folder),
+    ]:
+        map_path = map_dir / "track_map.yaml"
+        if map_path.exists():
+            tmap = TrackMap()
+            if tmap.load(str(map_path)):
+                track_features = build_track_features_for_dataset(
+                    df, tmap, lookahead=lookahead
+                )
+                logger.info(
+                    f"Track features: {track_features.shape[1]} dims "
+                    f"(lookahead={lookahead}) from {map_path}"
+                )
+            break
+
     try:
-        full_dataset = TelemetryDataset(df, train_cfg["sequence_history"])
+        full_dataset = TelemetryDataset(
+            df, train_cfg["sequence_history"],
+            track_features=track_features,
+        )
     except ValueError as e:
         logger.warning(f"Skipping {combo_name}: {e}")
         return False
@@ -105,9 +152,14 @@ def train_one_combo(
     # num_workers=0 on Windows avoids slow multiprocessing spawn overhead;
     # dataset fits in memory so DataLoader overhead is minimal
     num_workers = 0 if sys.platform == "win32" else 4
+
+    # Cap batch size to training set size so drop_last=True never drops
+    # the only batch (happens when a combo has very few clean laps).
+    effective_batch = min(train_cfg["batch_size"], len(train_set))
+
     train_loader = DataLoader(
         train_set,
-        batch_size=train_cfg["batch_size"],
+        batch_size=effective_batch,
         shuffle=True,
         num_workers=num_workers,
         pin_memory=True,
@@ -115,7 +167,7 @@ def train_one_combo(
     )
     val_loader = DataLoader(
         val_set,
-        batch_size=train_cfg["batch_size"] * 2,
+        batch_size=effective_batch * 2,
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
@@ -166,7 +218,7 @@ def train_one_combo(
         # Train
         model.train()
         train_loss_sum = 0.0
-        train_components = {"throttle": 0, "brake": 0, "steering": 0, "smoothness": 0}
+        train_components = {"throttle": 0, "brake": 0, "steering": 0, "smoothness": 0, "boundary": 0}
         t0 = time.time()
 
         for batch_state, batch_action in train_loader:
@@ -236,6 +288,7 @@ def train_one_combo(
                 "output_dim": full_dataset.output_dim,
                 "cfg": cfg,
                 "combo_name": combo_name,
+                "norm": norm_constants,
             }, best_path)
         else:
             epochs_no_improve += 1
@@ -255,6 +308,7 @@ def train_one_combo(
         "output_dim": full_dataset.output_dim,
         "cfg": cfg,
         "combo_name": combo_name,
+        "norm": norm_constants,
     }, last_path)
 
     logger.info(f"✓ Best val loss: {best_val_loss:.5f}  Checkpoint: {best_path}")
@@ -269,6 +323,8 @@ def main():
                         help="Track ID filter (e.g. 'sebring')")
     parser.add_argument("--car", default=None,
                         help="Car ID filter (e.g. 'mx5')")
+    parser.add_argument("--combo", default=None,
+                        help="Combo name filter (e.g. 'cadillacctsvr_summitpoint')")
     parser.add_argument("--all", action="store_true",
                         help="Train all track/car combos found in data folder")
     parser.add_argument("--config", default="config.yaml")
@@ -295,6 +351,11 @@ def main():
     # Find combos to train
     if args.all:
         combos = [d for d in data_root.iterdir() if d.is_dir()]
+    elif args.combo:
+        combos = [
+            d for d in data_root.iterdir()
+            if d.is_dir() and args.combo.lower() in d.name.lower()
+        ]
     elif args.track or args.car:
         pattern = f"{args.track or '*'}_{args.car or '*'}"
         combos = list(data_root.glob(pattern))
@@ -307,7 +368,7 @@ def main():
                 and (args.car is None or args.car.lower() in d.name.lower())
             ]
     else:
-        logger.error("Specify --track/--car or --all")
+        logger.error("Specify --combo, --track/--car, or --all")
         sys.exit(1)
 
     if not combos:

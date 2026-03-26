@@ -1,0 +1,18 @@
+{
+  "_comment": "Charlotte Motor Speedway oval. Pit road runs from front straight through turns 1-2, merging onto back straight at ~pct 0.40. Car starts in stall at ~pct 0.077.",
+  "stall_pullout_left_dur": 0.0,
+  "stall_pullout_right_dur": 0.0,
+  "stall_pullout_steer": 0.0,
+  "stall_pullout_throttle": 0.2,
+  "straight_duration": 3.0,
+  "straight_throttle": 0.3,
+  "turn_angle": 0.0,
+  "turn_duration": 0.0,
+  "turn_throttle": 0.3,
+  "ramp_duration": 0.0,
+  "cruise_until_lap_pct": 0.42,
+  "cruise_throttle": 0.45,
+  "cruise_steering": 0.15,
+  "pit_exit_track_pos": -0.3,
+  "launch_min_speed_ms": 0
+}

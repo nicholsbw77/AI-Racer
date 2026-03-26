@@ -4,6 +4,11 @@ trainer/loader.py
 Loads VRS/SRT tab-separated CSV exports and engineers the feature vectors
 used for behavior cloning training.
 
+Enhanced with:
+  - Extended state features (yaw_rate, slip_angle)
+  - Track-aware feature columns for segment context
+  - TrackMap integration for building track maps during preprocessing
+
 VRS CSV format notes (from SRT docs):
   - Tab-separated (not comma)
   - SI units: speed in m/s, distance in meters, angles in radians
@@ -38,11 +43,13 @@ COLUMN_CANDIDATES = {
     "steering":   ["steeringWheelAngle", "steering", "SteeringWheelAngle", "steer"],
     "gear":       ["gear", "Gear", "currentGear"],
     "rpm":        ["rpm", "RPM", "engineRPM"],
-    "lat_g":      ["accelerationY", "lateralAcceleration", "latG", "gLat"],
-    "lon_g":      ["accelerationX", "longitudinalAcceleration", "lonG", "gLon"],
+    "lat_g":      ["accelerationY", "lateralAcceleration", "latG", "gLat", "LatAccel"],
+    "lon_g":      ["accelerationX", "longitudinalAcceleration", "lonG", "gLon", "LongAccel"],
     "track_pos":  ["trackPosition", "track_position", "trackLat", "lanePosition"],
     "lap_dist":   ["lap_distance", "lapDistance", "distanceOnTrack"],
     "lap_time":   ["lap_time", "lapTime", "currentLapTime"],
+    "yaw_rate":   ["YawRate", "yaw_rate", "yawRate"],
+    "velocity_y": ["VelocityY", "velocity_y", "velY", "lateralVelocity"],
 }
 
 SYSTEM_COLS = ["validBin", "lapFlag", "lapIndex", "lapNum", "trackId", "carId",
@@ -116,12 +123,14 @@ def load_vrs_csv(filepath: str) -> Optional[pd.DataFrame]:
     return df
 
 
-def normalize_features(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
+def normalize_features(df: pd.DataFrame, cfg: dict):
     """
     Normalize raw telemetry values to [-1, 1] or [0, 1] ranges.
-    Modifies df in-place and returns it.
+    Modifies df in-place and returns (df, norm_consts) where norm_consts
+    is a dict of detected normalization constants (steering_lock_radians, rpm_max).
     """
     feat_cfg = cfg.get("features", {})
+    norm_consts = {}
 
     # Speed: normalize to [0, 1] using track max (computed per-session later)
     # Here we just ensure it's positive
@@ -132,7 +141,8 @@ def normalize_features(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
 
     # RPM: normalize 0-1 using observed max
     if "rpm" in df.columns:
-        rpm_max = df["rpm"].max()
+        rpm_max = float(df["rpm"].max())
+        norm_consts["rpm_max"] = rpm_max
         if rpm_max > 0:
             df["rpm"] = df["rpm"] / rpm_max
         else:
@@ -149,20 +159,35 @@ def normalize_features(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
         steering_lock = float(df["steering"].abs().quantile(0.99))
         if steering_lock < 0.1:
             steering_lock = np.pi  # fallback ~180 degrees
-        logger.debug(f"Auto-detected steering lock: {np.degrees(steering_lock):.1f}°")
+        logger.debug(f"Auto-detected steering lock: {np.degrees(steering_lock):.1f} deg")
+    norm_consts["steering_lock_radians"] = float(steering_lock)
 
     df["steering"] = (df["steering"] / steering_lock).clip(-1.0, 1.0)
 
-    # G-forces: normalize using typical racing limits (±4g)
+    # G-forces: normalize using typical racing limits (+/-4g)
     for col in ["lat_g", "lon_g"]:
         if col in df.columns:
-            df[col] = (df[col] / 40.0).clip(-1.0, 1.0)  # 40 m/s² ≈ 4g
+            df[col] = (df[col] / 40.0).clip(-1.0, 1.0)  # 40 m/s^2 ~ 4g
 
     # Track position: should already be -1 to +1, clamp it
     if "track_pos" in df.columns:
         df["track_pos"] = df["track_pos"].clip(-1.0, 1.0)
     else:
         df["track_pos"] = 0.0
+
+    # Yaw rate: normalize to [-1, 1] using +/-3 rad/s range
+    if "yaw_rate" in df.columns:
+        df["yaw_rate"] = (df["yaw_rate"] / 3.0).clip(-1.0, 1.0)
+    else:
+        df["yaw_rate"] = 0.0
+
+    # Lateral velocity -> slip angle proxy
+    if "velocity_y" in df.columns and "speed" in df.columns:
+        safe_speed = df["speed"].clip(lower=1.0)
+        df["slip_angle"] = np.arctan2(df["velocity_y"], safe_speed)
+        df["slip_angle"] = (df["slip_angle"] / 0.5).clip(-1.0, 1.0)
+    else:
+        df["slip_angle"] = 0.0
 
     # Lap distance pct: compute from lap_distance and trackLength
     if "trackLength" in df.columns and "lap_dist" in df.columns:
@@ -171,12 +196,12 @@ def normalize_features(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
             df["lap_dist_pct"] = (df["lap_dist"] / track_len).clip(0.0, 1.0)
         else:
             df["lap_dist_pct"] = 0.0
-    else:
+    elif "lap_dist_pct" not in df.columns and "lap_dist" in df.columns:
         # Normalize by observed max distance
         dist_max = df["lap_dist"].max()
         df["lap_dist_pct"] = (df["lap_dist"] / dist_max).clip(0.0, 1.0) if dist_max > 0 else 0.0
 
-    return df
+    return df, norm_consts
 
 
 def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -212,16 +237,34 @@ def compute_lap_times(df: pd.DataFrame) -> pd.Series:
     return df.groupby("lapIndex")["lap_time"].max()
 
 
-def filter_clean_laps(df: pd.DataFrame, threshold: float = 1.01) -> pd.DataFrame:
+def filter_clean_laps(
+    df: pd.DataFrame,
+    threshold: float = 1.01,
+    min_lap_time_s: float = 0.0,
+) -> pd.DataFrame:
     """
     Keep only laps within `threshold` * personal best lap time.
-    This ensures we only train on quality representative laps.
+    Laps shorter than `min_lap_time_s` are treated as partial/out-laps and
+    excluded before computing the personal best so they don't corrupt the
+    cutoff (e.g. a 5s out-lap starting near S/F would otherwise set PB=5s
+    and filter every real lap).
     """
     if "lapIndex" not in df.columns:
         return df
 
     lap_times = compute_lap_times(df)
     if len(lap_times) == 0:
+        return df
+
+    # Drop partial laps (too short to be a real timed lap)
+    if min_lap_time_s > 0:
+        n_partial = int((lap_times < min_lap_time_s).sum())
+        if n_partial:
+            logger.info(f"Dropping {n_partial} partial lap(s) under {min_lap_time_s:.0f}s")
+        lap_times = lap_times[lap_times >= min_lap_time_s]
+
+    if len(lap_times) == 0:
+        logger.warning("No valid laps remain after partial-lap filter — keeping all frames")
         return df
 
     personal_best = lap_times.min()
@@ -263,7 +306,7 @@ def load_track_car_dataset(
         df = load_vrs_csv(fpath)
         if df is None:
             continue
-        df = normalize_features(df, cfg)
+        df, _ = normalize_features(df, cfg)
         df = engineer_features(df)
 
         # Re-index lapIndex globally across files
@@ -312,6 +355,8 @@ STATE_FEATURES = [
     "steering_abs",     # steering magnitude (cornering context)
     "heavy_braking",    # braking zone flag
     "full_throttle",    # full throttle flag
+    "yaw_rate",         # yaw rotation rate (NEW)
+    "slip_angle",       # estimated slip angle (NEW)
 ]
 
 ACTION_FEATURES = [

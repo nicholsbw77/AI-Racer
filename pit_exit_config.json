@@ -1,0 +1,15 @@
+{
+  "straight_duration": 0.0,
+  "turn_angle": 0.0,
+  "turn_duration": 0.1,
+  "turn_throttle": 0.2,
+  "straight_throttle": 0.15,
+  "ramp_duration": 0.5,
+  "cruise_until_lap_pct": 0.03,
+  "cruise_throttle": 0.2,
+  "pit_exit_track_pos": 0.0,
+  "stall_pullout_left_dur": 1.5,
+  "stall_pullout_right_dur": 0.0,
+  "stall_pullout_steer": 0.0,
+  "stall_pullout_throttle": 0.15
+}
